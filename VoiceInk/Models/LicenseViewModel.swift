@@ -19,8 +19,19 @@ class LicenseViewModel: ObservableObject {
     private let polarService = PolarService()
     private let userDefaults = UserDefaults.standard
     private let licenseManager = LicenseManager.shared
+    private var isInitializing = true
 
     init() {
+        #if LOCAL_BUILD
+        licenseState = .licensed
+        #else
+        loadLicenseState()
+        #endif
+        isInitializing = false
+    }
+
+    /// Reload license state from storage. Use this instead of creating a new instance.
+    func reload() {
         #if LOCAL_BUILD
         licenseState = .licensed
         #else
@@ -33,7 +44,10 @@ class LicenseViewModel: ObservableObject {
         if licenseManager.trialStartDate == nil {
             licenseManager.trialStartDate = Date()
             licenseState = .trial(daysRemaining: trialPeriodDays)
-            NotificationCenter.default.post(name: .licenseStatusChanged, object: nil)
+            // Don't post notification during init to avoid recursive ViewModel creation
+            if !isInitializing {
+                NotificationCenter.default.post(name: .licenseStatusChanged, object: nil)
+            }
         }
     }
 
