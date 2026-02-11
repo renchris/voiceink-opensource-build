@@ -135,7 +135,11 @@ class WhisperState: NSObject, ObservableObject {
         loadCurrentTranscriptionModel()
         refreshAllAvailableModels()
     }
-    
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     private func createRecordingsDirectoryIfNeeded() {
         do {
             try FileManager.default.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true, attributes: nil)
