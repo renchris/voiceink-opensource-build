@@ -322,27 +322,43 @@ class UpdaterViewModel: ObservableObject {
     
     init() {
         updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
-        
-        // Enable automatic update checking
+
+        #if LOCAL_BUILD
+        // Disable auto-updates in local builds to prevent Sparkle from
+        // replacing our VoiceInk Dev-signed app with a production-signed
+        // version, which would invalidate TCC permissions.
+        updaterController.updater.automaticallyChecksForUpdates = false
+        #else
         updaterController.updater.automaticallyChecksForUpdates = autoUpdateCheck
+        #endif
         updaterController.updater.updateCheckInterval = 24 * 60 * 60
-        
+
         updaterController.updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
     }
-    
+
     func toggleAutoUpdates(_ value: Bool) {
+        #if !LOCAL_BUILD
         updaterController.updater.automaticallyChecksForUpdates = value
+        #endif
     }
-    
+
     func checkForUpdates() {
+        #if LOCAL_BUILD
+        // No-op in local builds — updates come via `voiceink-update` / `make local`
+        #else
         // This is for manual checks - will show UI
         updaterController.checkForUpdates(nil)
+        #endif
     }
-    
+
     func silentlyCheckForUpdates() {
+        #if LOCAL_BUILD
+        // No-op in local builds
+        #else
         // This checks for updates in the background without showing UI unless an update is found
         updaterController.updater.checkForUpdatesInBackground()
+        #endif
     }
 }
 
