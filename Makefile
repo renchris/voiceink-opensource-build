@@ -81,17 +81,32 @@ local: check setup
 			--entitlements "$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
 			--identifier "com.prakashjoshipax.VoiceInk" "$$APP_PATH"; \
 		mkdir -p "$$HOME/Applications"; \
-		echo "Copying VoiceInk.app to ~/Applications..."; \
-		rm -rf "$$HOME/Applications/VoiceInk.app"; \
-		ditto "$$APP_PATH" "$$HOME/Applications/VoiceInk.app"; \
+		echo "Deploying VoiceInk.app to ~/Applications..."; \
+		if [ -d "$$HOME/Applications/VoiceInk.app" ]; then \
+			rm -rf "$$HOME/Applications/VoiceInk.app.backup"; \
+			mv "$$HOME/Applications/VoiceInk.app" "$$HOME/Applications/VoiceInk.app.backup"; \
+		fi; \
+		ditto "$$APP_PATH" "$$HOME/Applications/VoiceInk.app" || { \
+			echo "ERROR: ditto failed, restoring backup..."; \
+			mv "$$HOME/Applications/VoiceInk.app.backup" "$$HOME/Applications/VoiceInk.app" 2>/dev/null; \
+			exit 1; \
+		}; \
+		rm -rf "$$HOME/Applications/VoiceInk.app.backup"; \
 		xattr -cr "$$HOME/Applications/VoiceInk.app"; \
+		echo "Cleaning up LaunchServices..."; \
+		LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"; \
+		"$$LSREGISTER" -u "$$APP_PATH" 2>/dev/null || true; \
+		for old_copy in "/Applications/VoiceInk.app" "$$HOME/Downloads/VoiceInk.app"; do \
+			[ -d "$$old_copy" ] && "$$LSREGISTER" -u "$$old_copy" 2>/dev/null || true; \
+		done; \
+		"$$LSREGISTER" -f "$$HOME/Applications/VoiceInk.app"; \
 		echo ""; \
 		echo "Build complete! App saved to: ~/Applications/VoiceInk.app"; \
 		echo "Run with: open ~/Applications/VoiceInk.app"; \
 		echo ""; \
 		echo "Limitations of local builds:"; \
 		echo "  - No iCloud dictionary sync"; \
-		echo "  - No automatic updates (pull new code and rebuild to update)"; \
+		echo "  - No Sparkle auto-updates (use voiceink-update or make local)"; \
 	else \
 		echo "Error: Could not find built VoiceInk.app in DerivedData."; \
 		exit 1; \
