@@ -1,7 +1,9 @@
 import Foundation
 import AppKit
+import os
 
 class CursorPaster {
+    private static let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "CursorPaster")
 
     static func pasteAtCursor(_ text: String) {
         let pasteboard = NSPasteboard.general
@@ -48,6 +50,7 @@ class CursorPaster {
     
     private static func pasteUsingAppleScript() -> Bool {
         guard AXIsProcessTrusted() else {
+            logger.error("pasteUsingAppleScript: AXIsProcessTrusted() returned false — Accessibility permission not granted")
             return false
         }
         
@@ -67,33 +70,52 @@ class CursorPaster {
     
     private static func pasteUsingCommandV() {
         guard AXIsProcessTrusted() else {
+            logger.error("pasteUsingCommandV: AXIsProcessTrusted() returned false — Accessibility permission not granted")
             return
         }
-        
-        let source = CGEventSource(stateID: .hidSystemState)
-        
-        let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true)
-        let vDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
-        let vUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
-        let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false)
-        
-        cmdDown?.flags = .maskCommand
-        vDown?.flags = .maskCommand
-        vUp?.flags = .maskCommand
-        
-        cmdDown?.post(tap: .cghidEventTap)
-        vDown?.post(tap: .cghidEventTap)
-        vUp?.post(tap: .cghidEventTap)
-        cmdUp?.post(tap: .cghidEventTap)
+
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            logger.error("pasteUsingCommandV: Failed to create CGEventSource")
+            return
+        }
+
+        guard let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true),
+              let vDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true),
+              let vUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false),
+              let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) else {
+            logger.error("pasteUsingCommandV: Failed to create CGEvents")
+            return
+        }
+
+        cmdDown.flags = .maskCommand
+        vDown.flags = .maskCommand
+        vUp.flags = .maskCommand
+
+        cmdDown.post(tap: .cghidEventTap)
+        vDown.post(tap: .cghidEventTap)
+        vUp.post(tap: .cghidEventTap)
+        cmdUp.post(tap: .cghidEventTap)
     }
 
     // Simulate pressing the Return / Enter key
     static func pressEnter() {
-        guard AXIsProcessTrusted() else { return }
-        let source = CGEventSource(stateID: .hidSystemState)
-        let enterDown = CGEvent(keyboardEventSource: source, virtualKey: 0x24, keyDown: true)
-        let enterUp = CGEvent(keyboardEventSource: source, virtualKey: 0x24, keyDown: false)
-        enterDown?.post(tap: .cghidEventTap)
-        enterUp?.post(tap: .cghidEventTap)
+        guard AXIsProcessTrusted() else {
+            logger.error("pressEnter: AXIsProcessTrusted() returned false — Accessibility permission not granted")
+            return
+        }
+
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            logger.error("pressEnter: Failed to create CGEventSource")
+            return
+        }
+
+        guard let enterDown = CGEvent(keyboardEventSource: source, virtualKey: 0x24, keyDown: true),
+              let enterUp = CGEvent(keyboardEventSource: source, virtualKey: 0x24, keyDown: false) else {
+            logger.error("pressEnter: Failed to create CGEvents")
+            return
+        }
+
+        enterDown.post(tap: .cghidEventTap)
+        enterUp.post(tap: .cghidEventTap)
     }
 }
