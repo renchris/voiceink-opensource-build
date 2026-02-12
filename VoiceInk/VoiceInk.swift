@@ -321,7 +321,12 @@ class UpdaterViewModel: ObservableObject {
     @Published var canCheckForUpdates = false
     
     init() {
+        #if LOCAL_BUILD
+        // Don't start Sparkle's scheduler at all in local builds
+        updaterController = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+        #else
         updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        #endif
 
         #if LOCAL_BUILD
         // Disable auto-updates in local builds to prevent Sparkle from
