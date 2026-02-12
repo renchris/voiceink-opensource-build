@@ -93,6 +93,10 @@ local: check setup
 		}; \
 		rm -rf "$$HOME/Applications/VoiceInk.app.backup"; \
 		xattr -cr "$$HOME/Applications/VoiceInk.app"; \
+		echo "Verifying code signature..."; \
+		codesign --verify --verbose "$$HOME/Applications/VoiceInk.app" || { \
+			echo "ERROR: Code signature verification failed!"; exit 1; \
+		}; \
 		echo "Cleaning up LaunchServices..."; \
 		LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"; \
 		"$$LSREGISTER" -u "$$APP_PATH" 2>/dev/null || true; \
