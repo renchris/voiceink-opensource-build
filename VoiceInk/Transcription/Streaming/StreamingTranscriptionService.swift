@@ -118,6 +118,8 @@ class StreamingTranscriptionService {
     private let chunkSource = AudioChunkSource()
     private var state: StreamingState = .idle
     private var committedSegments: [String] = []
+    /// Crash-safe file journal for the current session (nil unless monologue file logging is on).
+    private var journal: StreamingTranscriptJournal?
     private let modelContext: ModelContext
     private let fluidAudioService: FluidAudioTranscriptionService?
     private var onPartialTranscript: ((String) -> Void)?
@@ -154,6 +156,9 @@ class StreamingTranscriptionService {
         let start = Date()
         state = .connecting
         committedSegments = []
+        journal = UserDefaults.standard.bool(forKey: RecorderDisplaySettingsKeys.monologueFileLogging)
+            ? StreamingTranscriptJournal(startedAt: start)
+            : nil
         metrics.reset()
         firstPartialLogged = false
         firstCommitLogged = false
@@ -267,6 +272,8 @@ class StreamingTranscriptionService {
         }
 
         committedSegments = []
+        journal?.finish()
+        journal = nil
         logger.notice("Streaming cancelled")
     }
 
@@ -353,6 +360,8 @@ class StreamingTranscriptionService {
                         }
                         if !trimmed.isEmpty {
                             self.committedSegments.append(trimmed)
+                            // Persist immediately (fsync) so a crash can't lose confirmed text.
+                            self.journal?.append(trimmed)
                         }
                         // Refresh the live preview so it keeps showing the full running transcript
                         // after a commit (instead of resetting to empty until the next partial).
@@ -442,5 +451,7 @@ class StreamingTranscriptionService {
         provider = nil
         state = .idle
         committedSegments = []
+        journal?.finish()
+        journal = nil
     }
 }

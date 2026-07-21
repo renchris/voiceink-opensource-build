@@ -23,6 +23,7 @@ struct SettingsView: View {
     @AppStorage(AppLanguagePreference.userDefaultsKey) private var appLanguagePreference = AppLanguagePreference
         .systemValue
     @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
+    @AppStorage(RecorderDisplaySettingsKeys.monologueFileLogging) private var monologueFileLogging = false
     @State private var showResetOnboardingAlert = false
     @State private var showLanguageRestartAlert = false
     @State private var hasCancelRecordingShortcut = ShortcutStore.shortcut(for: .cancelRecorder) != nil
@@ -229,6 +230,13 @@ struct SettingsView: View {
                     HStack(spacing: 4) {
                         Text("Live Text Display")
                         InfoTip("Shows live text while recording with realtime models.")
+                    }
+                }
+
+                Toggle(isOn: $monologueFileLogging) {
+                    HStack(spacing: 4) {
+                        Text("Save Monologues to File")
+                        InfoTip("Writes streaming dictation to a timestamped file in Documents/VoiceInk Monologues as you speak, flushing each confirmed segment to disk so a long session survives a crash.")
                     }
                 }
             }
