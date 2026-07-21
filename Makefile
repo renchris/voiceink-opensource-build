@@ -4,6 +4,16 @@ WHISPER_CPP_DIR := $(DEPS_DIR)/whisper.cpp
 FRAMEWORK_PATH := $(WHISPER_CPP_DIR)/build-apple/whisper.xcframework
 LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
 
+# SHA-1 of the "VoiceInk Dev" certificate leaf. macOS TCC keys Accessibility and
+# Microphone grants on the app's designated requirement, which is
+#   identifier "com.prakashjoshipax.VoiceInk" and certificate leaf = H"<this>"
+# It pins no cdhash and no version, so grants survive arbitrary version bumps —
+# but only while this exact leaf keeps signing the app. Ad-hoc signing ("-")
+# drops the certificate clause entirely and silently revokes every grant.
+# Note `codesign --verify` returns 0 on an ad-hoc signature, so it cannot detect
+# that regression; the `local` target greps for this leaf instead.
+TCC_CERT_LEAF := fd29d610e439e8037c055b41c60fcd8d7b34d865
+
 .PHONY: all clean whisper setup build local check healthcheck help dev run
 
 # Default target
@@ -99,6 +109,15 @@ local: check setup
 		echo "Verifying code signature..."; \
 		codesign --verify --verbose "$$HOME/Applications/VoiceInk.app" || { \
 			echo "ERROR: Code signature verification failed!"; exit 1; \
+		}; \
+		echo "Verifying TCC-critical designated requirement..."; \
+		codesign -d -r- "$$HOME/Applications/VoiceInk.app" 2>&1 \
+			| grep -q 'certificate leaf = H"$(TCC_CERT_LEAF)"' || { \
+			echo "ERROR: designated requirement does not pin the VoiceInk Dev leaf."; \
+			echo "  TCC (Accessibility/Microphone) grants WILL be lost on this build."; \
+			echo "  Expected leaf: $(TCC_CERT_LEAF)"; \
+			echo "  Actual:"; codesign -d -r- "$$HOME/Applications/VoiceInk.app" 2>&1 | tail -1; \
+			exit 1; \
 		}; \
 		echo "Cleaning up LaunchServices..."; \
 		LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"; \
