@@ -65,7 +65,12 @@ actor WhisperContext {
         params.offset_ms = 0
         params.no_context = true
         params.single_segment = false
-        params.temperature = 0.2
+        // whisper.cpp's default is 0.0 (deterministic argmax). Any value > 0 routes
+        // every token through stochastic sampling instead, and removes the safest
+        // rung of the temperature-fallback ladder. Measured on an M1 Max over 4m15s
+        // of real dictation (fp16 large-v3-turbo, Metal): 0.2 took 26.52s, 0.0 took
+        // 10.54s — a 2.5x cost for non-deterministic output.
+        params.temperature = 0.0
 
         whisper_reset_timings(context)
 
