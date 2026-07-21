@@ -33,7 +33,13 @@ actor WhisperContext {
         guard let context = context else { return false }
 
         let maxThreads = max(1, min(8, cpuCount() - 2))
-        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        // Beam search recovers words that greedy decoding drops outright. Measured on
+        // an M1 Max over 4m15s of real dictation (fp16 large-v3-turbo, Metal, temp 0.0):
+        // greedy 5.80s / 2882 chars vs beam_size 5 6.38s / 2973 chars — ~10% slower for
+        // whole phrases greedy lost. Turbo has only 4 decoder layers, so beam is cheap
+        // here. OpenAI's reference decoder also uses beam_size 5.
+        var params = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH)
+        params.beam_search.beam_size = 5
 
         let selectedLanguage = language ?? "auto"
         if selectedLanguage != "auto" {
