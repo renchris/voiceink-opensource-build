@@ -471,8 +471,19 @@ class UpdaterViewModel: ObservableObject {
     @Published var automaticallyChecksForUpdates = false
 
     init() {
-        updaterController = SPUStandardUpdaterController(
-            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        // In local builds the app is signed with the "VoiceInk Dev" certificate. If Sparkle
+        // replaced it with a production-signed build, the code signature's designated
+        // requirement would change and macOS would revoke TCC grants (Accessibility,
+        // Microphone). Never start the scheduler at all — updates come from
+        // `voiceink-update` / `make local` instead.
+        #if LOCAL_BUILD
+            updaterController = SPUStandardUpdaterController(
+                startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+            updaterController.updater.automaticallyChecksForUpdates = false
+        #else
+            updaterController = SPUStandardUpdaterController(
+                startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        #endif
 
         automaticallyChecksForUpdates = updaterController.updater.automaticallyChecksForUpdates
 
@@ -484,12 +495,16 @@ class UpdaterViewModel: ObservableObject {
     }
 
     func setAutomaticallyChecksForUpdates(_ value: Bool) {
-        updaterController.updater.automaticallyChecksForUpdates = value
+        #if !LOCAL_BUILD
+            updaterController.updater.automaticallyChecksForUpdates = value
+        #endif
     }
 
     func checkForUpdates() {
-        // This is for manual checks - will show UI
-        updaterController.checkForUpdates(nil)
+        #if !LOCAL_BUILD
+            // This is for manual checks - will show UI
+            updaterController.checkForUpdates(nil)
+        #endif
     }
 }
 

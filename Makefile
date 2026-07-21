@@ -44,33 +44,76 @@ setup: whisper
 build: setup
 	xcodebuild -project VoiceInk.xcodeproj -scheme VoiceInk -configuration Debug CODE_SIGN_IDENTITY="" build
 
-# Build for local use without Apple Developer certificate
+# Build for local use, signed with the stable "VoiceInk Dev" certificate.
+# Signing with a real (self-signed) certificate instead of ad-hoc ("-") keeps the
+# code signature's designated requirement stable across rebuilds, so macOS TCC
+# grants (Accessibility, Microphone) survive. Ad-hoc signing produces a new
+# cdhash every build, which invalidates those grants.
 local: check setup
-	@echo "Building VoiceInk for local use (no Apple Developer certificate required)..."
+	@echo "Building VoiceInk for local use..."
+	@security find-identity -v -p codesigning | grep -q "VoiceInk Dev" || \
+		{ echo "Error: 'VoiceInk Dev' certificate not found in keychain."; \
+		  echo "See memory/adhoc-build.md for setup instructions."; exit 1; }
 	@rm -rf "$(LOCAL_DERIVED_DATA)"
 	xcodebuild -project VoiceInk.xcodeproj -scheme VoiceInk -configuration Debug \
 		-derivedDataPath "$(LOCAL_DERIVED_DATA)" \
 		-xcconfig LocalBuild.xcconfig \
-		CODE_SIGN_IDENTITY="-" \
+		CODE_SIGN_IDENTITY="" \
 		CODE_SIGNING_REQUIRED=NO \
-		CODE_SIGNING_ALLOWED=YES \
+		CODE_SIGNING_ALLOWED=NO \
 		DEVELOPMENT_TEAM="" \
 		CODE_SIGN_ENTITLEMENTS="$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
 		SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) LOCAL_BUILD' \
 		build
 	@APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Debug/VoiceInk.app" && \
 	if [ -d "$$APP_PATH" ]; then \
-		echo "Copying VoiceInk.app to ~/Downloads..."; \
-		rm -rf "$$HOME/Downloads/VoiceInk.app"; \
-		ditto "$$APP_PATH" "$$HOME/Downloads/VoiceInk.app"; \
-		xattr -cr "$$HOME/Downloads/VoiceInk.app"; \
+		echo "Re-signing with VoiceInk Dev certificate (inside-out)..."; \
+		for helper in "$$APP_PATH"/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/*.xpc; do \
+			[ -d "$$helper" ] && codesign --force --sign "VoiceInk Dev" "$$helper"; \
+		done; \
+		for helper in "$$APP_PATH"/Contents/Frameworks/Sparkle.framework/Versions/B/*.app; do \
+			[ -d "$$helper" ] && codesign --force --sign "VoiceInk Dev" "$$helper"; \
+		done; \
+		for fw in "$$APP_PATH"/Contents/Frameworks/*.framework; do \
+			[ -d "$$fw" ] && codesign --force --sign "VoiceInk Dev" "$$fw"; \
+		done; \
+		for bundle in "$$APP_PATH"/Contents/Resources/*.bundle; do \
+			[ -d "$$bundle" ] && codesign --force --sign "VoiceInk Dev" "$$bundle"; \
+		done; \
+		codesign --force --sign "VoiceInk Dev" \
+			--entitlements "$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
+			--identifier "com.prakashjoshipax.VoiceInk" "$$APP_PATH"; \
+		mkdir -p "$$HOME/Applications"; \
+		echo "Deploying VoiceInk.app to ~/Applications..."; \
+		if [ -d "$$HOME/Applications/VoiceInk.app" ]; then \
+			rm -rf "$$HOME/Applications/VoiceInk.app.backup"; \
+			mv "$$HOME/Applications/VoiceInk.app" "$$HOME/Applications/VoiceInk.app.backup"; \
+		fi; \
+		ditto "$$APP_PATH" "$$HOME/Applications/VoiceInk.app" || { \
+			echo "ERROR: ditto failed, restoring backup..."; \
+			mv "$$HOME/Applications/VoiceInk.app.backup" "$$HOME/Applications/VoiceInk.app" 2>/dev/null; \
+			exit 1; \
+		}; \
+		rm -rf "$$HOME/Applications/VoiceInk.app.backup"; \
+		xattr -cr "$$HOME/Applications/VoiceInk.app"; \
+		echo "Verifying code signature..."; \
+		codesign --verify --verbose "$$HOME/Applications/VoiceInk.app" || { \
+			echo "ERROR: Code signature verification failed!"; exit 1; \
+		}; \
+		echo "Cleaning up LaunchServices..."; \
+		LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"; \
+		"$$LSREGISTER" -u "$$APP_PATH" 2>/dev/null || true; \
+		for old_copy in "/Applications/VoiceInk.app" "$$HOME/Downloads/VoiceInk.app"; do \
+			[ -d "$$old_copy" ] && "$$LSREGISTER" -u "$$old_copy" 2>/dev/null || true; \
+		done; \
+		"$$LSREGISTER" -f "$$HOME/Applications/VoiceInk.app"; \
 		echo ""; \
-		echo "Build complete! App saved to: ~/Downloads/VoiceInk.app"; \
-		echo "Run with: open ~/Downloads/VoiceInk.app"; \
+		echo "Build complete! App saved to: ~/Applications/VoiceInk.app"; \
+		echo "Run with: open ~/Applications/VoiceInk.app"; \
 		echo ""; \
 		echo "Limitations of local builds:"; \
 		echo "  - No iCloud dictionary sync"; \
-		echo "  - No automatic updates (pull new code and rebuild to update)"; \
+		echo "  - No Sparkle auto-updates (use voiceink-update or make local)"; \
 	else \
 		echo "Error: Could not find built VoiceInk.app at $$APP_PATH"; \
 		exit 1; \
