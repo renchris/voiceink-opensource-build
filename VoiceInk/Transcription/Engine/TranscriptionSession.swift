@@ -59,6 +59,11 @@ final class StreamingTranscriptionSession: TranscriptionSession {
     private var startupTaskID: UUID?
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "StreamingTranscriptionSession")
 
+    /// Recordings at or above this length warn the user when they drop to batch decoding.
+    /// Short clips fall back routinely — the agreement engine needs a few confirmed segments
+    /// before it can finalize from the stream — and are not worth interrupting for.
+    private static let batchFallbackWarningThreshold: TimeInterval = 120
+
     init(streamingService: StreamingTranscriptionService, fallbackService: TranscriptionService) {
         self.streamingService = streamingService
         self.fallbackService = fallbackService
@@ -151,6 +156,26 @@ final class StreamingTranscriptionSession: TranscriptionSession {
         logger.notice(
             "Using batch fallback for \(model.displayName, privacy: .public) file=\(audioURL.lastPathComponent, privacy: .public)"
         )
+
+        // Batch decoding of long-form audio can omit content without raising an error, so a long
+        // recording that silently drops to this path yields a transcript that looks complete but
+        // is not. Surface it rather than substituting quietly — the WAV is always retained, so the
+        // user can re-transcribe if the result looks short.
+        let fallbackAudioDuration = await AudioFileMetadata.duration(for: audioURL)
+        if fallbackAudioDuration >= Self.batchFallbackWarningThreshold {
+            logger.warning(
+                "Long recording fell back to batch decoding duration=\(fallbackAudioDuration, format: .fixed(precision: 1), privacy: .public)s — transcript may be incomplete"
+            )
+            NotificationManager.shared.showNotification(
+                title: String(
+                    format: String(localized: "Live transcription dropped out — %d min re-decoded in batch, may be incomplete"),
+                    max(1, Int(fallbackAudioDuration / 60))
+                ),
+                type: .warning,
+                duration: 10.0
+            )
+        }
+
         let text = try await fallbackService.transcribe(audioURL: audioURL, model: model, context: context)
         logger.notice(
             "Batch fallback completed elapsed=\(Date().timeIntervalSince(fallbackStart), format: .fixed(precision: 3), privacy: .public)s chars=\(text.count, privacy: .public)"
