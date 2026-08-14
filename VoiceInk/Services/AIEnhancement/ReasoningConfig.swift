@@ -4,6 +4,7 @@ import LLMkit
 struct ReasoningConfig {
     // These models support "minimal", optimized for low-latency instruction following.
     static let geminiMinimalThinkingModels: Set<String> = [
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.5-flash",
