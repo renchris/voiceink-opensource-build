@@ -47,6 +47,7 @@ class RecordingShortcutManager: ObservableObject {
     private let modeShortcutManager: ModeShortcutManager
     private let shortcutMonitor = ShortcutMonitor()
     private var shortcutChangeObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
     private let shortcutModeHandler: RecordingShortcutModeHandler
     private let primaryRecordingShortcutModeSource: RecordingShortcutModeSource
 
@@ -152,6 +153,20 @@ class RecordingShortcutManager: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.refreshShortcutMonitoring()
+            }
+        }
+
+        // The CGEventTap does not survive system sleep, and no disable event is
+        // delivered for that teardown, so the callback's tapEnable path never fires.
+        // Reinstall it on wake or the recording shortcut stays dead until relaunch.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 500_000_000)
                 self?.refreshShortcutMonitoring()
             }
         }
@@ -323,6 +338,10 @@ class RecordingShortcutManager: ObservableObject {
     deinit {
         if let shortcutChangeObserver {
             NotificationCenter.default.removeObserver(shortcutChangeObserver)
+        }
+
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
 
         MainActor.assumeIsolated {
