@@ -11,8 +11,9 @@ struct ReasoningConfig {
         "gemini-3.1-flash-lite",
     ]
 
-    // Gemini 3.1 Pro does not support "minimal".
+    // These models reject "minimal" outright; "low" is their floor.
     static let geminiLowThinkingModels: Set<String> = [
+        "gemini-3.8-flash",
         "gemini-3.1-pro-preview",
     ]
 
