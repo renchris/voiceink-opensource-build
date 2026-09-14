@@ -207,23 +207,20 @@ class TranscriptionPipeline {
 
                     do {
                         let contextSnapshot = await recordingContextSnapshot()
-                        let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(
+                        let outcome = try await enhancementService.enhanceDetailed(
                             textForAI,
                             configuration: resolvedEnhancementConfiguration,
                             contextSnapshot: contextSnapshot
                         )
-                        transcription.enhancedText = enhancedText
+                        transcription.enhancedText = outcome.text
                         // The ladder may have landed on a different model than the
                         // mode configures, so record what actually ran.
-                        transcription.aiEnhancementModelName =
-                            enhancementService.lastUsedModelName
-                            ?? resolvedEnhancementConfiguration.modelName
-                            ?? resolvedEnhancementConfiguration.provider?.defaultModel
-                        transcription.promptName = promptName
-                        transcription.enhancementDuration = enhancementDuration
-                        transcription.aiRequestSystemMessage = enhancementService.lastSystemMessageSent
-                        transcription.aiRequestUserMessage = enhancementService.lastUserMessageSent
-                        finalText = enhancedText
+                        transcription.aiEnhancementModelName = outcome.modelName
+                        transcription.promptName = outcome.promptName
+                        transcription.enhancementDuration = outcome.duration
+                        transcription.aiRequestSystemMessage = outcome.systemMessage
+                        transcription.aiRequestUserMessage = outcome.userMessage
+                        finalText = outcome.text
                     } catch {
                         let errorDescription =
                             (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

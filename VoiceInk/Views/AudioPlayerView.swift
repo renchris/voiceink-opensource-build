@@ -599,18 +599,17 @@ struct AudioPlayerView: View {
 
         Task {
             do {
-                let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(
+                let outcome = try await enhancementService.enhanceDetailed(
                     transcription.text,
                     configuration: enhancementConfiguration
                 )
                 await MainActor.run {
-                    transcription.enhancedText = enhancedText
-                    transcription.aiEnhancementModelName =
-                        enhancementConfiguration.modelName ?? enhancementConfiguration.provider?.defaultModel
-                    transcription.promptName = promptName
-                    transcription.enhancementDuration = enhancementDuration
-                    transcription.aiRequestSystemMessage = enhancementService.lastSystemMessageSent
-                    transcription.aiRequestUserMessage = enhancementService.lastUserMessageSent
+                    transcription.enhancedText = outcome.text
+                    transcription.aiEnhancementModelName = outcome.modelName
+                    transcription.promptName = outcome.promptName
+                    transcription.enhancementDuration = outcome.duration
+                    transcription.aiRequestSystemMessage = outcome.systemMessage
+                    transcription.aiRequestUserMessage = outcome.userMessage
                     try? modelContext.save()
 
                     isReEnhancing = false
