@@ -342,7 +342,7 @@ class AIEnhancementService: ObservableObject {
         case .missingAPIKey:
             return .notConfigured
         case .httpError(let statusCode, let message):
-            if statusCode == 429 { return .rateLimitExceeded }
+            if statusCode == 429 { return .rateLimitExceeded(detail: RateLimitDetail.summarize(message)) }
             if (500...599).contains(statusCode) { return .serverError }
             return .customError("HTTP \(statusCode): \(message)")
         case .noResultReturned:
@@ -379,7 +379,10 @@ class AIEnhancementService: ObservableObject {
                 )
             } catch let error as EnhancementError {
                 switch error {
-                case .networkError, .serverError, .rateLimitExceeded:
+                // 429 is NOT retried here: LLMkit's performRequest already made three
+                // attempts with backoff, and a quota that is exhausted for the day only
+                // gets worse if we spend more of it.
+                case .networkError, .serverError:
                     retries += 1
                     if retries < maxRetries {
                         logger.warning(
@@ -543,7 +546,7 @@ enum EnhancementError: Error {
     case enhancementFailed
     case networkError
     case serverError
-    case rateLimitExceeded
+    case rateLimitExceeded(detail: String?)
     case timeout
     case customError(String)
 }
@@ -561,7 +564,10 @@ extension EnhancementError: LocalizedError {
             return String(localized: "Network connection failed. Check your internet.")
         case .serverError:
             return String(localized: "The AI provider's server encountered an error. Please try again later.")
-        case .rateLimitExceeded:
+        case .rateLimitExceeded(let detail):
+            if let detail, !detail.isEmpty {
+                return String(format: String(localized: "Rate limit exceeded — %@"), detail)
+            }
             return String(localized: "Rate limit exceeded. Please try again later.")
         case .timeout:
             return String(
@@ -569,5 +575,77 @@ extension EnhancementError: LocalizedError {
         case .customError(let message):
             return message
         }
+    }
+}
+
+/// Extracts the provider's own explanation out of a 429 body.
+///
+/// Every provider says which limit was hit — a per-minute burst that clears in
+/// seconds, or a daily quota that does not clear until tomorrow — and the two
+/// call for opposite reactions. Discarding that body left every 429 reading
+/// "Rate limit exceeded. Please try again later.", which is advice for the first
+/// case and wrong for the second.
+enum RateLimitDetail {
+    private static let maxLength = 200
+
+    static func summarize(_ body: String) -> String? {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        guard let data = trimmed.data(using: .utf8),
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return condense(trimmed)
+        }
+
+        let error = root["error"] as? [String: Any] ?? root
+        let details = error["details"] as? [[String: Any]] ?? []
+
+        var parts: [String] = []
+        if let quota = quotaIdentifier(in: details) { parts.append(quota) }
+        if let retryDelay = retryDelay(in: details) { parts.append("retry in \(retryDelay)") }
+        if let message = error["message"] as? String,
+            !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            parts.append(message)
+        }
+
+        guard !parts.isEmpty else { return condense(trimmed) }
+        return condense(parts.joined(separator: " — "))
+    }
+
+    /// Google's QuotaFailure violations name the exact bucket, e.g.
+    /// `GenerateRequestsPerDayPerProjectPerModel-FreeTier`.
+    private static func quotaIdentifier(in details: [[String: Any]]) -> String? {
+        for detail in details {
+            guard let violations = detail["violations"] as? [[String: Any]] else { continue }
+            for violation in violations {
+                if let quotaId = violation["quotaId"] as? String, !quotaId.isEmpty {
+                    return quotaId
+                }
+                if let quotaMetric = violation["quotaMetric"] as? String, !quotaMetric.isEmpty {
+                    return quotaMetric
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Google's RetryInfo carries the wait the server itself wants, e.g. `27s`.
+    private static func retryDelay(in details: [[String: Any]]) -> String? {
+        for detail in details {
+            if let retryDelay = detail["retryDelay"] as? String, !retryDelay.isEmpty {
+                return retryDelay
+            }
+        }
+        return nil
+    }
+
+    private static func condense(_ text: String) -> String? {
+        let collapsed = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return nil }
+        return collapsed.count > maxLength ? String(collapsed.prefix(maxLength)) + "…" : collapsed
     }
 }
