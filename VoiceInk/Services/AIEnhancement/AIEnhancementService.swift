@@ -15,6 +15,9 @@ class AIEnhancementService: ObservableObject {
     }
 
     @Published var lastSystemMessageSent: String?
+    /// The model that actually produced the last enhancement. Differs from the
+    /// mode's configured model whenever the fallback ladder was walked.
+    @Published var lastUsedModelName: String?
     @Published var lastUserMessageSent: String?
 
     var allPrompts: [CustomPrompt] {
@@ -144,6 +147,93 @@ class AIEnhancementService: ObservableObject {
         quotaCooldownDuration[key] = nil
     }
 
+    // MARK: - Fallback ladder
+
+    /// Where enhancement goes when the configured model is out of quota, in order:
+    ///   1. models of the SAME provider the user already chose in another mode
+    ///   2. that provider's remaining published models
+    ///   3. other enhancement providers they have connected, at their selected model
+    ///   4. a local provider, last and only when armed (see isLocalFallbackEnabled)
+    /// Rungs already in cooldown are dropped, so a ladder walked once is not
+    /// re-walked on the next dictation. Running off the end is not a failure: the
+    /// caller delivers the raw transcript, which beats a stall.
+    struct EnhancementFallback {
+        let provider: AIProvider
+        let modelName: String
+    }
+
+    /// Bounds the worst case for a single dictation. Cooldowns persist between
+    /// dictations, so a longer ladder is still walked in full — just across
+    /// several recordings instead of making one of them wait for all of it.
+    private let maximumFallbackAttempts = 2
+
+    /// Local models on this hardware have measured far slower than the cloud, so
+    /// a local rung gets a tighter budget than the user's enhancement timeout. It
+    /// is a fallback; it may not become the new stall.
+    private let localFallbackTimeout: TimeInterval = 8
+
+    /// Off by default: a local rung that times out reintroduces exactly the delay
+    /// this ladder exists to remove. Arm it once a local model is fast enough.
+    private var isLocalFallbackEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "EnhancementFallbackToLocal")
+    }
+
+    private func isLocalProvider(_ provider: AIProvider?) -> Bool {
+        provider == .ollama || provider == .localCLI
+    }
+
+    private func fallbackLadder(after configuration: EnhancementRuntimeConfiguration) -> [EnhancementFallback] {
+        guard let provider = configuration.provider else { return [] }
+
+        var seen: Set<String> = ["\(provider.rawValue)/\(configuration.modelName ?? provider.defaultModel)"]
+        var ladder: [EnhancementFallback] = []
+
+        func append(_ candidateProvider: AIProvider, _ modelName: String) {
+            guard !modelName.isEmpty else { return }
+            let key = "\(candidateProvider.rawValue)/\(modelName)"
+            guard !seen.contains(key) else { return }
+            seen.insert(key)
+            ladder.append(EnhancementFallback(provider: candidateProvider, modelName: modelName))
+        }
+
+        // 1. Their own choices elsewhere come before our list order.
+        for mode in ModeManager.shared.configurations
+        where mode.selectedAIProvider == provider.rawValue {
+            if let modelName = mode.selectedAIModel { append(provider, modelName) }
+        }
+
+        // 2. The rest of this provider's models.
+        for modelName in aiService.availableModels(for: provider) { append(provider, modelName) }
+
+        // 3. Other providers they have actually connected.
+        let connected = aiService.connectedProviders
+        for candidate in connected where candidate != provider && !isLocalProvider(candidate) {
+            append(candidate, aiService.selectedModel(for: candidate))
+        }
+
+        // 4. Local, last, and only when armed.
+        if isLocalFallbackEnabled {
+            for candidate in connected where isLocalProvider(candidate) {
+                append(candidate, aiService.selectedModel(for: candidate))
+            }
+        }
+
+        return ladder.filter { rung in
+            !isQuotaCooldownActive(
+                for: configuration.replacingModel(provider: rung.provider, modelName: rung.modelName)
+            )
+        }
+    }
+
+    private func announceFallback(to configuration: EnhancementRuntimeConfiguration) {
+        guard let provider = configuration.provider else { return }
+        let modelName = configuration.modelName ?? provider.defaultModel
+        NotificationManager.shared.showNotification(
+            title: String(format: String(localized: "Enhanced with %@ — your usual model is out of quota"), modelName),
+            type: .info
+        )
+    }
+
     private func waitForRateLimit() async throws {
         if let lastRequest = lastRequestTime {
             let timeSinceLastRequest = Date().timeIntervalSince(lastRequest)
@@ -233,8 +323,10 @@ class AIEnhancementService: ObservableObject {
     private func makeRequest(
         text: String,
         configuration: EnhancementRuntimeConfiguration,
-        contextSnapshot: RecordingContextSnapshot?
+        contextSnapshot: RecordingContextSnapshot?,
+        timeoutOverride: TimeInterval? = nil
     ) async throws -> String {
+        let requestTimeout = timeoutOverride ?? baseTimeout
         guard isConfigured(for: configuration) else {
             throw EnhancementError.notConfigured
         }
@@ -270,7 +362,7 @@ class AIEnhancementService: ObservableObject {
                     text: formattedText,
                     systemPrompt: systemMessage,
                     model: modelName,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
                 return AIEnhancementOutputFilter.filter(result)
             } catch {
@@ -316,7 +408,7 @@ class AIEnhancementService: ObservableObject {
                     systemPrompt: systemMessage,
                     thinkingLevel: ReasoningConfig.geminiThinkingLevel(for: modelName),
                     store: false,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             case .anthropic:
                 result = try await AnthropicLLMClient.chatCompletion(
@@ -324,7 +416,7 @@ class AIEnhancementService: ObservableObject {
                     model: modelName,
                     messages: [.user(formattedText)],
                     systemPrompt: systemMessage,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             case .custom:
                 guard
@@ -340,7 +432,7 @@ class AIEnhancementService: ObservableObject {
                     messages: [.user(formattedText)],
                     systemPrompt: systemMessage,
                     temperature: 0.3,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             default:
                 guard let baseURL = URL(string: provider.baseURL) else {
@@ -365,7 +457,7 @@ class AIEnhancementService: ObservableObject {
                     temperature: temperature,
                     reasoningEffort: reasoningEffort,
                     extraBody: extraBody,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             }
             return AIEnhancementOutputFilter.filter(result.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -423,6 +515,7 @@ class AIEnhancementService: ObservableObject {
         text: String,
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot?,
+        timeoutOverride: TimeInterval? = nil,
         maxRetries: Int = 3,
         initialDelay: TimeInterval = 1.0
     ) async throws -> String {
@@ -434,7 +527,8 @@ class AIEnhancementService: ObservableObject {
                 return try await makeRequest(
                     text: text,
                     configuration: configuration,
-                    contextSnapshot: contextSnapshot
+                    contextSnapshot: contextSnapshot,
+                    timeoutOverride: timeoutOverride
                 )
             } catch let error as EnhancementError {
                 switch error {
@@ -504,23 +598,46 @@ class AIEnhancementService: ObservableObject {
     ) async throws -> (String, TimeInterval, String?) {
         let startTime = Date()
         let promptName = configuration.prompt?.title
+        lastUsedModelName = nil
 
-        do {
-            let result = try await makeRequestWithRetry(
-                text: text,
-                configuration: configuration,
-                contextSnapshot: contextSnapshot
-            )
-            let endTime = Date()
-            let duration = endTime.timeIntervalSince(startTime)
-            clearQuotaCooldown(for: configuration)
-            return (result, duration, promptName)
-        } catch let error as EnhancementError {
-            if case .rateLimitExceeded(_, let retryAfter) = error {
-                openQuotaCooldown(for: configuration, retryAfter: retryAfter)
+        var attempt = configuration
+        var remainingRungs = fallbackLadder(after: configuration)
+        var isFallback = false
+        var lastError: EnhancementError?
+
+        for _ in 0...maximumFallbackAttempts {
+            do {
+                let result = try await makeRequestWithRetry(
+                    text: text,
+                    configuration: attempt,
+                    contextSnapshot: contextSnapshot,
+                    timeoutOverride: isFallback && isLocalProvider(attempt.provider) ? localFallbackTimeout : nil
+                )
+                clearQuotaCooldown(for: attempt)
+                lastUsedModelName = attempt.modelName ?? attempt.provider?.defaultModel
+                if isFallback {
+                    announceFallback(to: attempt)
+                    logger.notice("Enhanced via fallback model \(self.lastUsedModelName ?? "?", privacy: .public)")
+                }
+                return (result, Date().timeIntervalSince(startTime), promptName)
+            } catch let error as EnhancementError {
+                lastError = error
+
+                // Only a quota refusal moves down the ladder. Everything else —
+                // a bad key, a malformed request, a timeout — would fail the same
+                // way on every rung, so trying them all just spends the time this
+                // ladder exists to save.
+                guard case .rateLimitExceeded(_, let retryAfter) = error else { throw error }
+                openQuotaCooldown(for: attempt, retryAfter: retryAfter)
+
+                guard !remainingRungs.isEmpty else { break }
+                let next = remainingRungs.removeFirst()
+                attempt = configuration.replacingModel(provider: next.provider, modelName: next.modelName)
+                isFallback = true
             }
-            throw error
         }
+
+        throw lastError ?? EnhancementError.enhancementFailed
     }
 
     func captureScreenContext() async {

@@ -210,8 +210,11 @@ class TranscriptionPipeline {
                             contextSnapshot: contextSnapshot
                         )
                         transcription.enhancedText = enhancedText
+                        // The ladder may have landed on a different model than the
+                        // mode configures, so record what actually ran.
                         transcription.aiEnhancementModelName =
-                            resolvedEnhancementConfiguration.modelName
+                            enhancementService.lastUsedModelName
+                            ?? resolvedEnhancementConfiguration.modelName
                             ?? resolvedEnhancementConfiguration.provider?.defaultModel
                         transcription.promptName = promptName
                         transcription.enhancementDuration = enhancementDuration
