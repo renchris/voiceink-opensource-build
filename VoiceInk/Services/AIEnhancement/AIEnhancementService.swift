@@ -88,6 +88,62 @@ class AIEnhancementService: ObservableObject {
         return APIKeyManager.shared.hasAPIKey(forProvider: provider.rawValue)
     }
 
+    // MARK: - Quota cooldown
+
+    /// A model that is out of quota refuses in a quarter of a second and keeps
+    /// refusing until the quota resets, so asking it again on the next dictation
+    /// buys nothing and costs the caller the whole retry ladder. Once a model
+    /// reports an exhausted quota it is skipped until the cooldown expires; each
+    /// consecutive refusal doubles the wait, and one success clears it.
+    private var quotaCooldownUntil: [String: Date] = [:]
+    private var quotaCooldownDuration: [String: TimeInterval] = [:]
+    private let minimumQuotaCooldown: TimeInterval = 60
+    private let maximumQuotaCooldown: TimeInterval = 3600
+
+    private func quotaKey(for configuration: EnhancementRuntimeConfiguration) -> String? {
+        guard let provider = configuration.provider else { return nil }
+        return "\(provider.rawValue)/\(configuration.modelName ?? provider.defaultModel)"
+    }
+
+    /// True while the configured model is known to be out of quota. Callers skip
+    /// enhancement entirely rather than paying a round trip to be refused.
+    func isQuotaCooldownActive(for configuration: EnhancementRuntimeConfiguration) -> Bool {
+        guard let key = quotaKey(for: configuration), let until = quotaCooldownUntil[key] else {
+            return false
+        }
+        guard until > Date() else {
+            quotaCooldownUntil[key] = nil
+            return false
+        }
+        return true
+    }
+
+    private func openQuotaCooldown(
+        for configuration: EnhancementRuntimeConfiguration,
+        retryAfter: TimeInterval?
+    ) {
+        guard let key = quotaKey(for: configuration) else { return }
+
+        let duration: TimeInterval
+        if let previous = quotaCooldownDuration[key] {
+            duration = min(previous * 2, maximumQuotaCooldown)
+        } else {
+            duration = min(max(retryAfter ?? minimumQuotaCooldown, minimumQuotaCooldown), maximumQuotaCooldown)
+        }
+
+        quotaCooldownDuration[key] = duration
+        quotaCooldownUntil[key] = Date().addingTimeInterval(duration)
+        logger.warning(
+            "Quota exhausted for \(key, privacy: .public) — skipping enhancement for \(Int(duration), privacy: .public)s"
+        )
+    }
+
+    private func clearQuotaCooldown(for configuration: EnhancementRuntimeConfiguration) {
+        guard let key = quotaKey(for: configuration) else { return }
+        quotaCooldownUntil[key] = nil
+        quotaCooldownDuration[key] = nil
+    }
+
     private func waitForRateLimit() async throws {
         if let lastRequest = lastRequestTime {
             let timeSinceLastRequest = Date().timeIntervalSince(lastRequest)
@@ -342,7 +398,10 @@ class AIEnhancementService: ObservableObject {
         case .missingAPIKey:
             return .notConfigured
         case .httpError(let statusCode, let message):
-            if statusCode == 429 { return .rateLimitExceeded(detail: RateLimitDetail.summarize(message)) }
+            if statusCode == 429 {
+                let parsed = RateLimitDetail.parse(message)
+                return .rateLimitExceeded(detail: parsed.summary, retryAfter: parsed.retryAfter)
+            }
             if (500...599).contains(statusCode) { return .serverError }
             return .customError("HTTP \(statusCode): \(message)")
         case .noResultReturned:
@@ -454,8 +513,12 @@ class AIEnhancementService: ObservableObject {
             )
             let endTime = Date()
             let duration = endTime.timeIntervalSince(startTime)
+            clearQuotaCooldown(for: configuration)
             return (result, duration, promptName)
-        } catch {
+        } catch let error as EnhancementError {
+            if case .rateLimitExceeded(_, let retryAfter) = error {
+                openQuotaCooldown(for: configuration, retryAfter: retryAfter)
+            }
             throw error
         }
     }
@@ -546,7 +609,7 @@ enum EnhancementError: Error {
     case enhancementFailed
     case networkError
     case serverError
-    case rateLimitExceeded(detail: String?)
+    case rateLimitExceeded(detail: String?, retryAfter: TimeInterval?)
     case timeout
     case customError(String)
 }
@@ -564,7 +627,7 @@ extension EnhancementError: LocalizedError {
             return String(localized: "Network connection failed. Check your internet.")
         case .serverError:
             return String(localized: "The AI provider's server encountered an error. Please try again later.")
-        case .rateLimitExceeded(let detail):
+        case .rateLimitExceeded(let detail, _):
             if let detail, !detail.isEmpty {
                 return String(format: String(localized: "Rate limit exceeded — %@"), detail)
             }
@@ -578,67 +641,107 @@ extension EnhancementError: LocalizedError {
     }
 }
 
-/// Extracts the provider's own explanation out of a 429 body.
+/// Pulls the actionable facts out of a 429 body: which model and limit were hit,
+/// and how long the provider wants us to wait.
 ///
-/// Every provider says which limit was hit — a per-minute burst that clears in
-/// seconds, or a daily quota that does not clear until tomorrow — and the two
-/// call for opposite reactions. Discarding that body left every 429 reading
-/// "Rate limit exceeded. Please try again later.", which is advice for the first
-/// case and wrong for the second.
+/// The lead sentence is boilerplate on every provider ("check your plan and
+/// billing details", two documentation URLs), so a naive prefix of the message
+/// truncates to pure noise. The facts sit at the END of Gemini's message and in
+/// a `details` array on the classic generateContent API; both are read here.
 enum RateLimitDetail {
-    private static let maxLength = 200
-
-    static func summarize(_ body: String) -> String? {
-        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        guard let data = trimmed.data(using: .utf8),
-            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return condense(trimmed)
-        }
-
-        let error = root["error"] as? [String: Any] ?? root
-        let details = error["details"] as? [[String: Any]] ?? []
-
-        var parts: [String] = []
-        if let quota = quotaIdentifier(in: details) { parts.append(quota) }
-        if let retryDelay = retryDelay(in: details) { parts.append("retry in \(retryDelay)") }
-        if let message = error["message"] as? String,
-            !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            parts.append(message)
-        }
-
-        guard !parts.isEmpty else { return condense(trimmed) }
-        return condense(parts.joined(separator: " — "))
+    struct Parsed {
+        let summary: String?
+        let retryAfter: TimeInterval?
     }
 
-    /// Google's QuotaFailure violations name the exact bucket, e.g.
-    /// `GenerateRequestsPerDayPerProjectPerModel-FreeTier`.
-    private static func quotaIdentifier(in details: [[String: Any]]) -> String? {
+    private static let maxLength = 200
+
+    static func parse(_ body: String) -> Parsed {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return Parsed(summary: nil, retryAfter: nil) }
+
+        let root = (trimmed.data(using: .utf8)).flatMap {
+            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        }
+        let error = (root?["error"] as? [String: Any]) ?? root
+        let message = (error?["message"] as? String) ?? trimmed
+        let details = error?["details"] as? [[String: Any]] ?? []
+
+        let retryAfter = retrySeconds(inMessage: message) ?? retrySeconds(inDetails: details)
+
+        var parts: [String] = []
+        if let quota = quotaClause(inMessage: message) {
+            parts.append(quota)
+        } else if let quotaId = quotaIdentifier(inDetails: details) {
+            parts.append(quotaId)
+        } else {
+            parts.append(message)
+        }
+        if let retryAfter {
+            parts.append("retry in \(Int(retryAfter.rounded()))s")
+        }
+
+        return Parsed(summary: condense(parts.joined(separator: " — ")), retryAfter: retryAfter)
+    }
+
+    /// Gemini states the binding limit as
+    /// `... metric: <host>/<metric>, limit: 20, model: gemini-3.8-flash`.
+    /// Reordered here so the model and the number survive the 80-character
+    /// truncation the notification applies.
+    private static func quotaClause(inMessage message: String) -> String? {
+        let limit = firstMatch(#"limit:\s*(\d+)"#, in: message)
+        let model = firstMatch(#"model:\s*([A-Za-z0-9._\-]+)"#, in: message)
+        let metric = firstMatch(#"metric:\s*([^,\s]+)"#, in: message)
+            .map { $0.components(separatedBy: "/").last ?? $0 }
+
+        switch (model, limit) {
+        case let (model?, limit?):
+            guard let metric else { return "\(model) hit its limit of \(limit) requests" }
+            return "\(model) hit its limit of \(limit) requests (\(metric))"
+        case let (model?, nil):
+            return "\(model) is out of quota"
+        case let (nil, limit?):
+            return "quota limit of \(limit) requests reached"
+        default:
+            return nil
+        }
+    }
+
+    /// The classic generateContent API reports the bucket as a QuotaFailure
+    /// violation, e.g. `GenerateRequestsPerDayPerProjectPerModel-FreeTier`.
+    private static func quotaIdentifier(inDetails details: [[String: Any]]) -> String? {
         for detail in details {
             guard let violations = detail["violations"] as? [[String: Any]] else { continue }
             for violation in violations {
-                if let quotaId = violation["quotaId"] as? String, !quotaId.isEmpty {
-                    return quotaId
-                }
-                if let quotaMetric = violation["quotaMetric"] as? String, !quotaMetric.isEmpty {
-                    return quotaMetric
-                }
+                if let quotaId = violation["quotaId"] as? String, !quotaId.isEmpty { return quotaId }
+                if let metric = violation["quotaMetric"] as? String, !metric.isEmpty { return metric }
             }
         }
         return nil
     }
 
-    /// Google's RetryInfo carries the wait the server itself wants, e.g. `27s`.
-    private static func retryDelay(in details: [[String: Any]]) -> String? {
+    private static func retrySeconds(inMessage message: String) -> TimeInterval? {
+        firstMatch(#"retry in ([0-9]+(?:\.[0-9]+)?)s"#, in: message).flatMap(TimeInterval.init)
+    }
+
+    private static func retrySeconds(inDetails details: [[String: Any]]) -> TimeInterval? {
         for detail in details {
-            if let retryDelay = detail["retryDelay"] as? String, !retryDelay.isEmpty {
-                return retryDelay
+            guard let retryDelay = detail["retryDelay"] as? String else { continue }
+            if let seconds = TimeInterval(retryDelay.replacingOccurrences(of: "s", with: "")) {
+                return seconds
             }
         }
         return nil
+    }
+
+    private static func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard
+            let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+            let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+            match.numberOfRanges > 1,
+            let range = Range(match.range(at: 1), in: text)
+        else { return nil }
+        return String(text[range])
     }
 
     private static func condense(_ text: String) -> String? {

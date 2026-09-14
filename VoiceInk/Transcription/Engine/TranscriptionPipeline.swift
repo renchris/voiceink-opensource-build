@@ -169,11 +169,27 @@ class TranscriptionPipeline {
                     !shouldRespondInRecorder && isSkipShortEnhancementEnabled
                     && WordCounter.count(in: text) <= shortEnhancementWordThreshold
 
+                // A model that is out of quota refuses every request until the
+                // quota resets, so dictation after dictation would pay the retry
+                // ladder to be told the same thing. Deliver the raw transcript
+                // immediately instead. Assistant modes are exempt: there the
+                // model's answer IS the output, so silence would be worse than
+                // the wait.
+                let isEnhancementQuotaExhausted =
+                    !shouldRespondInRecorder
+                    && resolvedEnhancementConfiguration.flatMap { configuration in
+                        enhancementService?.isQuotaCooldownActive(for: configuration)
+                    } == true
+                if isEnhancementQuotaExhausted {
+                    logger.warning("Skipping enhancement — configured model is out of quota")
+                }
+
                 if let enhancementService,
                     let resolvedEnhancementConfiguration,
                     resolvedEnhancementConfiguration.isEnabled,
                     enhancementService.isConfigured(for: resolvedEnhancementConfiguration),
-                    !shouldSkipEnhancement
+                    !shouldSkipEnhancement,
+                    !isEnhancementQuotaExhausted
                 {
                     if shouldCancel() {
                         await finishCanceledTranscription()
