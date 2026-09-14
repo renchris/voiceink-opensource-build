@@ -753,6 +753,91 @@ class AIEnhancementService: ObservableObject {
         throw lastError ?? EnhancementError.enhancementFailed
     }
 
+    // MARK: - Caller contract
+
+    /// Everything one enhancement produced, returned as a unit. Callers read the
+    /// model and the request payload from HERE, never from the published `last…`
+    /// slots: a file import running beside a dictation can overwrite those across
+    /// an `await`, pairing one request's prompt with another's result.
+    struct EnhancementOutcome {
+        let text: String
+        let duration: TimeInterval
+        let promptName: String?
+        /// The model that actually answered. Differs from the configured one
+        /// whenever the fallback ladder was walked.
+        let modelName: String?
+        let systemMessage: String?
+        let userMessage: String?
+    }
+
+    func enhanceDetailed(
+        _ text: String,
+        configuration: EnhancementRuntimeConfiguration,
+        contextSnapshot: RecordingContextSnapshot? = nil
+    ) async throws -> EnhancementOutcome {
+        let (result, duration, promptName) = try await enhance(
+            text,
+            configuration: configuration,
+            contextSnapshot: contextSnapshot
+        )
+        return EnhancementOutcome(
+            text: result,
+            duration: duration,
+            promptName: promptName,
+            modelName: lastUsedModelName ?? configuration.modelName ?? configuration.provider?.defaultModel,
+            systemMessage: lastSystemMessageSent,
+            userMessage: lastUserMessageSent
+        )
+    }
+
+    /// For requests that bypass `enhance()` — the assistant's follow-up turns. The
+    /// model to ask: the given one when healthy, otherwise the first ladder rung
+    /// that is. Nil means every rung is cooling.
+    func resolveModel(
+        provider: AIProvider,
+        modelName: String?,
+        textLength: Int
+    ) -> (provider: AIProvider, modelName: String)? {
+        let requested = EnhancementRuntimeConfiguration(
+            mode: nil,
+            isEnabled: true,
+            prompt: nil,
+            provider: provider,
+            modelName: modelName,
+            useClipboardContext: false,
+            useSelectedTextContext: false,
+            useScreenCaptureContext: false
+        )
+        guard let usable = usableConfiguration(for: requested, textLength: textLength),
+            let usableProvider = usable.provider
+        else { return nil }
+        return (usableProvider, usable.modelName ?? usableProvider.defaultModel)
+    }
+
+    /// Feeds the result of such a request back into the cooldown map: a quota
+    /// refusal cools the model exactly as it would inside `enhance()`, and a
+    /// success clears it.
+    func recordOutcome(provider: AIProvider, modelName: String, error: Error?) {
+        let configuration = EnhancementRuntimeConfiguration(
+            mode: nil,
+            isEnabled: true,
+            prompt: nil,
+            provider: provider,
+            modelName: modelName,
+            useClipboardContext: false,
+            useSelectedTextContext: false,
+            useScreenCaptureContext: false
+        )
+        guard let error else {
+            clearQuotaCooldown(for: configuration)
+            return
+        }
+        let mapped = (error as? LLMKitError).map(mapLLMKitError) ?? (error as? EnhancementError)
+        if case .rateLimitExceeded(_, let retryAfter)? = mapped {
+            openQuotaCooldown(for: configuration, retryAfter: retryAfter)
+        }
+    }
+
     func captureScreenContext() async {
         guard CGPreflightScreenCaptureAccess() else {
             return
