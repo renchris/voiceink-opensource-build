@@ -188,6 +188,108 @@ enum EnhancementLadderPolicy {
         return Descent(next: next, remaining: candidates)
     }
 
+    // MARK: - Quota cooldowns
+
+    /// Which quota bucket a refusal came from. It decides how long the model sits
+    /// out: a daily cap is gone until the provider's reset, a per-minute cap is
+    /// back within a minute, and one backoff rule for both is wrong in opposite
+    /// directions — hours of re-probing a dead model, or benching a live one.
+    enum QuotaPeriod: Equatable {
+        case perDay
+        case perMinute
+        case unknown
+    }
+
+    struct QuotaCooldown: Equatable {
+        let until: Date
+        /// What this cooldown lasted; the next refusal of unknown period doubles it.
+        let duration: TimeInterval
+
+        func isActive(at now: Date) -> Bool {
+            until > now
+        }
+
+        /// The duration outlives the cooldown so a model that refuses again soon
+        /// after it expired backs off further instead of starting over at 60s —
+        /// but not forever: a day after it ended, the refusal is history.
+        func isRetained(at now: Date) -> Bool {
+            now < until.addingTimeInterval(quotaEscalationMemory)
+        }
+    }
+
+    static let minimumQuotaCooldown: TimeInterval = 60
+    /// Four hours: the ceiling only governs how often a model whose limit period
+    /// the provider did not name is re-probed. Each probe costs one refusal.
+    static let maximumQuotaCooldown: TimeInterval = 14400
+    static let quotaEscalationMemory: TimeInterval = 24 * 3600
+    /// Gemini resets daily quotas at midnight Pacific. The margin keeps the first
+    /// probe after it from landing on a server whose clock is a few seconds
+    /// behind ours, which would spend a refusal and cool the model for a day.
+    static let dailyQuotaResetMargin: TimeInterval = 60
+    /// A daily cooldown lasts at most a day and a minute, so anything longer read
+    /// back from disk was written under a clock that has since been corrected.
+    static let maximumRestoredCooldown: TimeInterval = 25 * 3600
+
+    /// The cooldown a fresh refusal opens. `previous` is the model's last cooldown
+    /// (active or not); a caller must not open a second one while it is active,
+    /// or a burst of concurrent refusals would double it once per request.
+    static func cooldown(
+        forRefusal period: QuotaPeriod,
+        retryAfter: TimeInterval?,
+        previous: QuotaCooldown?,
+        now: Date
+    ) -> QuotaCooldown {
+        let duration: TimeInterval
+        switch period {
+        case .perDay:
+            // Nothing earlier can succeed, whatever retryAfter says: Gemini sends
+            // a seconds-scale retryDelay even on a daily cap.
+            let until = nextDailyQuotaReset(after: now)
+            return QuotaCooldown(until: until, duration: until.timeIntervalSince(now))
+        case .perMinute:
+            // Never doubled: the bucket refills on its own schedule, and a second
+            // refusal says the minute is still busy, not that it got longer.
+            duration = max(retryAfter ?? minimumQuotaCooldown, minimumQuotaCooldown)
+        case .unknown:
+            // The provider's own wait is honoured on every refusal, not only the
+            // first; doubling is only the floor under it.
+            let escalation = previous.flatMap { $0.isRetained(at: now) ? $0.duration * 2 : nil }
+            duration = max(retryAfter ?? 0, escalation ?? minimumQuotaCooldown)
+        }
+        let clamped = min(max(duration, minimumQuotaCooldown), maximumQuotaCooldown)
+        return QuotaCooldown(until: now.addingTimeInterval(clamped), duration: clamped)
+    }
+
+    /// The next midnight in America/Los_Angeles, plus the margin. Measured from
+    /// `now - margin` so a refusal inside the margin — written against the
+    /// previous day's count — waits for this reset, not the next one.
+    static func nextDailyQuotaReset(after now: Date) -> Date {
+        let fallback = now.addingTimeInterval(24 * 3600)
+        guard let pacific = TimeZone(identifier: "America/Los_Angeles") else { return fallback }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = pacific
+        guard
+            let midnight = calendar.nextDate(
+                after: now.addingTimeInterval(-dailyQuotaResetMargin),
+                matching: DateComponents(hour: 0, minute: 0, second: 0),
+                matchingPolicy: .nextTime
+            )
+        else { return fallback }
+        return midnight.addingTimeInterval(dailyQuotaResetMargin)
+    }
+
+    /// A cooldown read back from disk, or nil when it should be forgotten. The
+    /// clamp matters because nothing else can end a cooldown early: a cooling
+    /// model is dropped from the ladder, so it is never asked, never succeeds,
+    /// and a wrong `until` would bench it indefinitely.
+    static func restoredCooldown(until: Date, duration: TimeInterval?, now: Date) -> QuotaCooldown? {
+        let cooldown = QuotaCooldown(
+            until: min(until, now.addingTimeInterval(maximumRestoredCooldown)),
+            duration: duration ?? minimumQuotaCooldown
+        )
+        return cooldown.isRetained(at: now) ? cooldown : nil
+    }
+
     // MARK: - Error mapping
 
     static func isCancellation(_ error: Error) -> Bool {

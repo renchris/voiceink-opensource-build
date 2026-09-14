@@ -27,8 +27,12 @@ class AIEnhancementService: ObservableObject {
     private let aiService: AIService
     private let screenCaptureService: ScreenCaptureService
     private let customVocabularyService: CustomVocabularyService
+    /// Where the enhancement settings and the quota cooldowns live. Injectable
+    /// because the test host shares the app's bundle id, so `.standard` there is
+    /// the user's live preferences.
+    private let defaults: UserDefaults
     private var baseTimeout: TimeInterval {
-        let stored = UserDefaults.standard.integer(forKey: "EnhancementTimeoutSeconds")
+        let stored = defaults.integer(forKey: "EnhancementTimeoutSeconds")
         return stored > 0 ? TimeInterval(stored) : 7
     }
     private let rateLimitInterval: TimeInterval = 1.0
@@ -37,9 +41,10 @@ class AIEnhancementService: ObservableObject {
 
     @Published var lastCapturedClipboard: String?
 
-    init(aiService: AIService = AIService(), modelContext: ModelContext) {
+    init(aiService: AIService = AIService(), modelContext: ModelContext, defaults: UserDefaults = .standard) {
         self.aiService = aiService
         self.modelContext = modelContext
+        self.defaults = defaults
         self.screenCaptureService = ScreenCaptureService()
         self.customVocabularyService = CustomVocabularyService.shared
 
@@ -66,8 +71,15 @@ class AIEnhancementService: ObservableObject {
         NotificationCenter.default.removeObserver(self)
     }
 
+    /// A new key — or the same account moved to a paid tier — has its own quota,
+    /// so every cooldown was measured against a quota that may no longer apply.
+    /// Forgetting them costs at most one refusal per still-exhausted model.
     @objc private func handleAPIKeyChange() {
         DispatchQueue.main.async {
+            if !self.quotaCooldowns.isEmpty {
+                self.quotaCooldowns.removeAll()
+                self.persistQuotaCooldowns()
+            }
             self.objectWillChange.send()
         }
     }
@@ -99,21 +111,17 @@ class AIEnhancementService: ObservableObject {
 
     // MARK: - Quota cooldown
 
-    /// A model that is out of quota refuses in a quarter of a second and keeps
-    /// refusing until the quota resets, so asking it again on the next dictation
-    /// buys nothing and costs the caller the whole retry ladder. Once a model
-    /// reports an exhausted quota it is skipped until the cooldown expires; each
-    /// consecutive refusal doubles the wait, and one success clears it.
+    /// A model that is out of quota keeps refusing until the quota resets, and
+    /// each refusal costs LLMkit's three attempts, so asking it again on the next
+    /// dictation buys nothing. Once a model reports an exhausted quota it is
+    /// skipped until the cooldown expires — how long is
+    /// `EnhancementLadderPolicy.cooldown(forRefusal:…)` — and one success clears it.
     ///
     /// Persisted, because the common case is a DAILY cap: an in-memory map forgets
     /// every exhausted model on relaunch, and the next dictation then pays the
-    /// refusal all over again for a quota that has hours left to run.
-    private var quotaCooldownUntil: [String: Date] = [:]
-    private var quotaCooldownDuration: [String: TimeInterval] = [:]
-    private let minimumQuotaCooldown: TimeInterval = 60
-    /// Four hours, not one: these are daily caps, and the ceiling only governs how
-    /// often a still-exhausted model is re-probed. Each probe costs one refusal.
-    private let maximumQuotaCooldown: TimeInterval = 14400
+    /// refusal all over again for a quota that has hours left to run. Expired
+    /// entries stay (for a day) so the escalation survives a relaunch too.
+    private var quotaCooldowns: [String: EnhancementLadderPolicy.QuotaCooldown] = [:]
     private let quotaCooldownDefaultsKey = "EnhancementQuotaCooldowns"
 
     private func quotaKey(for configuration: EnhancementRuntimeConfiguration) -> String? {
@@ -131,69 +139,69 @@ class AIEnhancementService: ObservableObject {
     }
 
     private func isQuotaCooldownActive(key: String) -> Bool {
-        guard let until = quotaCooldownUntil[key] else {
-            return false
-        }
-        guard until > Date() else {
-            quotaCooldownUntil[key] = nil
-            persistQuotaCooldowns()
-            return false
-        }
-        return true
+        quotaCooldowns[key]?.isActive(at: Date()) ?? false
     }
 
     private func openQuotaCooldown(
         for configuration: EnhancementRuntimeConfiguration,
-        retryAfter: TimeInterval?
+        retryAfter: TimeInterval?,
+        period: EnhancementLadderPolicy.QuotaPeriod
     ) {
         guard let key = quotaKey(for: configuration) else { return }
+        let now = Date()
+        let previous = quotaCooldowns[key]
 
-        let duration: TimeInterval
-        if let previous = quotaCooldownDuration[key] {
-            duration = min(previous * 2, maximumQuotaCooldown)
-        } else {
-            duration = min(max(retryAfter ?? minimumQuotaCooldown, minimumQuotaCooldown), maximumQuotaCooldown)
-        }
+        // Concurrent requests (a file import beside a dictation) all refuse at
+        // once; the first refusal already opened the cooldown, and letting the
+        // rest re-open it would double the wait once per request in flight.
+        if let previous, previous.isActive(at: now) { return }
 
-        quotaCooldownDuration[key] = duration
-        quotaCooldownUntil[key] = Date().addingTimeInterval(duration)
+        let cooldown = EnhancementLadderPolicy.cooldown(
+            forRefusal: period,
+            retryAfter: retryAfter,
+            previous: previous,
+            now: now
+        )
+        quotaCooldowns[key] = cooldown
         persistQuotaCooldowns()
         logger.warning(
-            "Quota exhausted for \(key, privacy: .public) — skipping it for \(Int(duration), privacy: .public)s"
+            "Quota exhausted for \(key, privacy: .public) (\(String(describing: period), privacy: .public)) — skipping it for \(Int(cooldown.duration), privacy: .public)s"
         )
     }
 
     private func clearQuotaCooldown(for configuration: EnhancementRuntimeConfiguration) {
         guard let key = quotaKey(for: configuration) else { return }
-        guard quotaCooldownUntil[key] != nil || quotaCooldownDuration[key] != nil else { return }
-        quotaCooldownUntil[key] = nil
-        quotaCooldownDuration[key] = nil
+        guard quotaCooldowns.removeValue(forKey: key) != nil else { return }
         persistQuotaCooldowns()
     }
 
+    /// Writes every retained entry, expired ones included — dropping them here is
+    /// what used to erase the escalation on every persist. Entries a day past
+    /// their end are forgotten, which also keeps the map from growing.
     private func persistQuotaCooldowns() {
-        let stored = quotaCooldownUntil.reduce(into: [String: [String: TimeInterval]]()) { result, entry in
-            result[entry.key] = [
-                "until": entry.value.timeIntervalSince1970,
-                "duration": quotaCooldownDuration[entry.key] ?? minimumQuotaCooldown,
-            ]
+        let now = Date()
+        quotaCooldowns = quotaCooldowns.filter { $0.value.isRetained(at: now) }
+        let stored = quotaCooldowns.mapValues { cooldown -> [String: TimeInterval] in
+            ["until": cooldown.until.timeIntervalSince1970, "duration": cooldown.duration]
         }
-        UserDefaults.standard.set(stored, forKey: quotaCooldownDefaultsKey)
+        defaults.set(stored, forKey: quotaCooldownDefaultsKey)
     }
 
     private func restoreQuotaCooldowns() {
-        guard
-            let stored = UserDefaults.standard.dictionary(forKey: quotaCooldownDefaultsKey)
-                as? [String: [String: TimeInterval]]
-        else { return }
+        guard let stored = defaults.dictionary(forKey: quotaCooldownDefaultsKey) else { return }
 
         let now = Date()
-        for (key, entry) in stored {
-            guard let untilInterval = entry["until"] else { continue }
-            let until = Date(timeIntervalSince1970: untilInterval)
-            guard until > now else { continue }
-            quotaCooldownUntil[key] = until
-            quotaCooldownDuration[key] = entry["duration"] ?? minimumQuotaCooldown
+        for (key, value) in stored {
+            guard
+                let entry = value as? [String: TimeInterval],
+                let untilInterval = entry["until"],
+                let cooldown = EnhancementLadderPolicy.restoredCooldown(
+                    until: Date(timeIntervalSince1970: untilInterval),
+                    duration: entry["duration"],
+                    now: now
+                )
+            else { continue }
+            quotaCooldowns[key] = cooldown
         }
     }
 
@@ -202,7 +210,7 @@ class AIEnhancementService: ObservableObject {
     /// Off by default: a local rung that times out reintroduces exactly the delay
     /// this ladder exists to remove. Arm it once a local model is fast enough.
     private var isLocalFallbackEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "EnhancementFallbackToLocal")
+        defaults.bool(forKey: "EnhancementFallbackToLocal")
     }
 
     /// The ladder for `anchor`'s mode (order: `EnhancementLadderPolicy.ladder`).
@@ -562,7 +570,11 @@ class AIEnhancementService: ObservableObject {
         case .httpError(let statusCode, let message):
             if statusCode == 429 {
                 let parsed = RateLimitDetail.parse(message)
-                return .rateLimitExceeded(detail: parsed.summary, retryAfter: parsed.retryAfter)
+                return .rateLimitExceeded(
+                    detail: parsed.summary,
+                    retryAfter: parsed.retryAfter,
+                    period: parsed.quotaPeriod
+                )
             }
             if (500...599).contains(statusCode) { return .serverError }
             return .customError("HTTP \(statusCode): \(message)")
@@ -578,7 +590,7 @@ class AIEnhancementService: ObservableObject {
     }
 
     private var retryOnTimeout: Bool {
-        UserDefaults.standard.bool(forKey: "EnhancementRetryOnTimeout")
+        defaults.bool(forKey: "EnhancementRetryOnTimeout")
     }
 
     /// Only a timeout is retried here, and only on the configured model. A 429,
@@ -713,8 +725,8 @@ class AIEnhancementService: ObservableObject {
                 if kind == .cancelled { throw CancellationError() }
                 lastError = error
 
-                if case .rateLimitExceeded(_, let retryAfter)? = error as? EnhancementError {
-                    openQuotaCooldown(for: attempt, retryAfter: retryAfter)
+                if case .rateLimitExceeded(_, let retryAfter, let period)? = error as? EnhancementError {
+                    openQuotaCooldown(for: attempt, retryAfter: retryAfter, period: period)
                 }
 
                 guard
@@ -782,8 +794,8 @@ class AIEnhancementService: ObservableObject {
             return
         }
         let mapped = (error as? LLMKitError).map(mapLLMKitError) ?? (error as? EnhancementError)
-        if case .rateLimitExceeded(_, let retryAfter)? = mapped {
-            openQuotaCooldown(for: configuration, retryAfter: retryAfter)
+        if case .rateLimitExceeded(_, let retryAfter, let period)? = mapped {
+            openQuotaCooldown(for: configuration, retryAfter: retryAfter, period: period)
         }
     }
 
@@ -873,7 +885,13 @@ enum EnhancementError: Error {
     case enhancementFailed
     case networkError
     case serverError
-    case rateLimitExceeded(detail: String?, retryAfter: TimeInterval?)
+    /// `period` decides how long the model is cooled; it defaults so a refusal
+    /// raised without a provider body stays `.unknown` rather than guessed.
+    case rateLimitExceeded(
+        detail: String?,
+        retryAfter: TimeInterval?,
+        period: EnhancementLadderPolicy.QuotaPeriod = .unknown
+    )
     case timeout
     case customError(String)
 }
@@ -891,7 +909,7 @@ extension EnhancementError: LocalizedError {
             return String(localized: "Network connection failed. Check your internet.")
         case .serverError:
             return String(localized: "The AI provider's server encountered an error. Please try again later.")
-        case .rateLimitExceeded(let detail, _):
+        case .rateLimitExceeded(let detail, _, _):
             if let detail, !detail.isEmpty {
                 return String(format: String(localized: "Rate limit exceeded — %@"), detail)
             }
@@ -916,13 +934,16 @@ enum RateLimitDetail {
     struct Parsed {
         let summary: String?
         let retryAfter: TimeInterval?
+        /// Which bucket refused. Read independently of `summary`, whose readable
+        /// quota clause would otherwise hide the only string that names it.
+        let quotaPeriod: EnhancementLadderPolicy.QuotaPeriod
     }
 
     private static let maxLength = 200
 
     static func parse(_ body: String) -> Parsed {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return Parsed(summary: nil, retryAfter: nil) }
+        guard !trimmed.isEmpty else { return Parsed(summary: nil, retryAfter: nil, quotaPeriod: .unknown) }
 
         let root = (trimmed.data(using: .utf8)).flatMap {
             try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
@@ -932,11 +953,13 @@ enum RateLimitDetail {
         let details = error?["details"] as? [[String: Any]] ?? []
 
         let retryAfter = retrySeconds(inMessage: message) ?? retrySeconds(inDetails: details)
+        let quotaIds = quotaIdentifiers(inDetails: details)
+        let quotaPeriod = period(named: quotaIds.joined(separator: " ")) ?? period(named: message) ?? .unknown
 
         var parts: [String] = []
         if let quota = quotaClause(inMessage: message) {
             parts.append(quota)
-        } else if let quotaId = quotaIdentifier(inDetails: details) {
+        } else if let quotaId = quotaIds.first {
             parts.append(quotaId)
         } else {
             parts.append(message)
@@ -945,7 +968,21 @@ enum RateLimitDetail {
             parts.append("retry in \(Int(retryAfter.rounded()))s")
         }
 
-        return Parsed(summary: condense(parts.joined(separator: " — ")), retryAfter: retryAfter)
+        return Parsed(
+            summary: condense(parts.joined(separator: " — ")),
+            retryAfter: retryAfter,
+            quotaPeriod: quotaPeriod
+        )
+    }
+
+    /// The period a quota id or message names: `GenerateRequestsPerDayPerProject…`
+    /// (Gemini's details), `…_per_model_per_day` (Gemini's metric), or "requests
+    /// per day (RPD)" (OpenAI). A daily violation wins when several are listed —
+    /// the model is out for the day, however soon the per-minute bucket refills.
+    private static func period(named text: String) -> EnhancementLadderPolicy.QuotaPeriod? {
+        if firstMatch(#"(per[\s_-]?day)"#, in: text) != nil { return .perDay }
+        if firstMatch(#"(per[\s_-]?min)"#, in: text) != nil { return .perMinute }
+        return nil
     }
 
     /// Gemini states the binding limit as
@@ -972,20 +1009,40 @@ enum RateLimitDetail {
     }
 
     /// The classic generateContent API reports the bucket as a QuotaFailure
-    /// violation, e.g. `GenerateRequestsPerDayPerProjectPerModel-FreeTier`.
-    private static func quotaIdentifier(inDetails details: [[String: Any]]) -> String? {
-        for detail in details {
-            guard let violations = detail["violations"] as? [[String: Any]] else { continue }
-            for violation in violations {
-                if let quotaId = violation["quotaId"] as? String, !quotaId.isEmpty { return quotaId }
-                if let metric = violation["quotaMetric"] as? String, !metric.isEmpty { return metric }
+    /// violation, e.g. `GenerateRequestsPerDayPerProjectPerModel-FreeTier`. All
+    /// of them, in order: one refusal can breach a per-minute and a per-day
+    /// bucket together.
+    private static func quotaIdentifiers(inDetails details: [[String: Any]]) -> [String] {
+        details.flatMap { detail -> [String] in
+            let violations = detail["violations"] as? [[String: Any]] ?? []
+            return violations.compactMap { violation in
+                [violation["quotaId"], violation["quotaMetric"]]
+                    .compactMap { $0 as? String }
+                    .first { !$0.isEmpty }
             }
         }
-        return nil
     }
 
+    /// Gemini: "Please retry in 17.5s". OpenAI and the providers that copy its
+    /// format: "Please try again in 20s", "in 820ms", "in 1m26.4s". Without the
+    /// second form every non-Gemini refusal fell back to the 60s floor.
     private static func retrySeconds(inMessage message: String) -> TimeInterval? {
-        firstMatch(#"retry in ([0-9]+(?:\.[0-9]+)?)s"#, in: message).flatMap(TimeInterval.init)
+        guard
+            let regex = try? NSRegularExpression(
+                pattern: #"(?:retry|try again) in (?:(\d+)m(?!s))?(?:(\d+(?:\.\d+)?)(ms|s))?"#,
+                options: [.caseInsensitive]
+            ),
+            let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message))
+        else { return nil }
+
+        func group(_ index: Int) -> String? {
+            Range(match.range(at: index), in: message).map { String(message[$0]) }
+        }
+        let minutes = group(1).flatMap(TimeInterval.init)
+        let value = group(2).flatMap(TimeInterval.init)
+        guard minutes != nil || value != nil else { return nil }
+        let seconds = (value ?? 0) / (group(3)?.lowercased() == "ms" ? 1000 : 1)
+        return (minutes ?? 0) * 60 + seconds
     }
 
     private static func retrySeconds(inDetails details: [[String: Any]]) -> TimeInterval? {
