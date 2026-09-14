@@ -136,7 +136,8 @@ class VoiceInkEngine: NSObject, ObservableObject {
         if let aiService = enhancementService?.getAIService() {
             self.assistantChat = AssistantChatService(
                 modelContext: modelContext,
-                aiService: aiService
+                aiService: aiService,
+                enhancementService: enhancementService
             )
         } else {
             self.assistantChat = nil

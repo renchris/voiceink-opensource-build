@@ -39,16 +39,12 @@ extension VoiceInkEngine {
                     assistantChat.applyAssistantTurn(
                         transcription: transcription,
                         response: reply,
-                        provider: provider,
-                        modelName: modelName,
                         promptName: promptName
                     )
                 } else {
                     try assistantChat.saveTypedAssistantTurn(
                         input: trimmed,
                         response: reply,
-                        provider: provider,
-                        modelName: modelName,
                         promptName: promptName,
                         modeName: modeName,
                         modeEmoji: modeEmoji

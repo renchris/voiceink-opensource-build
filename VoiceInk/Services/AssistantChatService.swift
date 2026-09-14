@@ -9,19 +9,25 @@ final class AssistantChatService {
         let duration: TimeInterval
         let systemPrompt: String?
         let requestLog: String
+        /// Who actually answered — a ladder rung when the configured model was
+        /// cooling — so the saved row names the model that wrote the text.
+        let provider: AIProvider
+        let modelName: String
     }
 
     private let modelContext: ModelContext
     private let aiService: AIService
+    private let enhancementService: AIEnhancementService?
 
     private var requestTimeout: TimeInterval {
         let stored = UserDefaults.standard.integer(forKey: "EnhancementTimeoutSeconds")
         return stored > 0 ? TimeInterval(stored) : 7
     }
 
-    init(modelContext: ModelContext, aiService: AIService) {
+    init(modelContext: ModelContext, aiService: AIService, enhancementService: AIEnhancementService?) {
         self.modelContext = modelContext
         self.aiService = aiService
+        self.enhancementService = enhancementService
     }
 
     func requestAssistantReply(
@@ -39,32 +45,54 @@ final class AssistantChatService {
             }
         }
 
-        let startTime = Date()
-        let text = try await aiService.completeChat(
+        // Follow-ups bypass enhance(), so they consult the cooldown map here: a
+        // model already refusing on quota would only refuse again. When every
+        // rung is cooling, ask the configured model anyway — for an assistant the
+        // answer IS the output, so a wait beats silence (the pipeline's exemption).
+        let textLength = messages.reduce(0) { $0 + $1.content.count }
+        let target = enhancementService?.resolveModel(
             provider: provider,
             modelName: modelName,
-            messages: chatMessages,
-            systemPrompt: systemPrompt,
-            timeout: requestTimeout
-        )
+            textLength: textLength
+        ) ?? (provider: provider, modelName: modelName ?? provider.defaultModel)
+
+        let startTime = Date()
+        let text: String
+        do {
+            text = try await aiService.completeChat(
+                provider: target.provider,
+                modelName: target.modelName,
+                messages: chatMessages,
+                systemPrompt: systemPrompt,
+                timeout: requestTimeout
+            )
+        } catch {
+            // A cancelled turn says nothing about the model's quota.
+            if !(error is CancellationError) {
+                enhancementService?.recordOutcome(
+                    provider: target.provider, modelName: target.modelName, error: error)
+            }
+            throw error
+        }
+        enhancementService?.recordOutcome(provider: target.provider, modelName: target.modelName, error: nil)
 
         return Reply(
             text: text,
             duration: Date().timeIntervalSince(startTime),
             systemPrompt: systemPrompt,
-            requestLog: Self.requestLog(from: messages)
+            requestLog: Self.requestLog(from: messages),
+            provider: target.provider,
+            modelName: target.modelName
         )
     }
 
     func applyAssistantTurn(
         transcription: Transcription,
         response: Reply,
-        provider: AIProvider,
-        modelName: String?,
         promptName: String?
     ) {
         transcription.enhancedText = response.text
-        transcription.aiEnhancementModelName = modelName ?? provider.defaultModel
+        transcription.aiEnhancementModelName = response.modelName
         transcription.promptName = promptName
         transcription.enhancementDuration = response.duration
         transcription.aiRequestSystemMessage = response.systemPrompt
@@ -75,8 +103,6 @@ final class AssistantChatService {
     func saveTypedAssistantTurn(
         input: String,
         response: Reply,
-        provider: AIProvider,
-        modelName: String?,
         promptName: String?,
         modeName: String?,
         modeEmoji: String?
@@ -85,7 +111,7 @@ final class AssistantChatService {
             text: input,
             duration: 0,
             enhancedText: response.text,
-            aiEnhancementModelName: modelName ?? provider.defaultModel,
+            aiEnhancementModelName: response.modelName,
             promptName: promptName,
             enhancementDuration: response.duration,
             aiRequestSystemMessage: response.systemPrompt,
