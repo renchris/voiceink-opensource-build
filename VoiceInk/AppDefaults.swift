@@ -63,6 +63,7 @@ enum AppDefaults {
             "ShortEnhancementWordThreshold": 3,
             "EnhancementTimeoutSeconds": 7,
             "EnhancementRetryOnTimeout": true,
+            "EnhancementFallbackToLocal": false,
 
             // Model
             "PrewarmModelOnWake": true,

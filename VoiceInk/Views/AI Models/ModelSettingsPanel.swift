@@ -88,6 +88,7 @@ private struct EnhancementModelSettingsView: View {
     @AppStorage("ShortEnhancementWordThreshold") private var shortEnhancementWordThreshold = 3
     @AppStorage("EnhancementTimeoutSeconds") private var enhancementTimeoutSeconds = 7
     @AppStorage("EnhancementRetryOnTimeout") private var retryOnTimeout = true
+    @AppStorage("EnhancementFallbackToLocal") private var fallbackToLocal = false
     @State private var isShortEnhancementExpanded = false
 
     var body: some View {
@@ -131,6 +132,20 @@ private struct EnhancementModelSettingsView: View {
                         "Set how long to wait for the AI provider to respond. If no response is received within this duration, you can either fail immediately and paste the original transcription, or retry the request up to 3 attempts."
                     )
                 }
+            }
+
+            Section {
+                Toggle(isOn: $fallbackToLocal) {
+                    HStack(spacing: 4) {
+                        Text("Fall back to a local model (Experimental)")
+                        InfoTip(
+                            "When every cloud model fails — out of quota, or unreachable during an outage — try Ollama or your Local CLI last. Requires a connected local provider with a suitable model selected in Model Catalog → Local & CLI Providers. The local attempt gets a 12-second budget, and a model that is not already loaded usually needs longer than that on its first use."
+                        )
+                    }
+                }
+                .toggleStyle(.switch)
+            } header: {
+                Text("Fallback")
             }
         }
         .formStyle(.grouped)
