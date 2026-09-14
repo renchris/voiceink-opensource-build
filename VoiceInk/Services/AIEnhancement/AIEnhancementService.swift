@@ -52,6 +52,7 @@ class AIEnhancementService: ObservableObject {
         }
 
         repairModePromptSelections()
+        restoreQuotaCooldowns()
 
         NotificationCenter.default.addObserver(
             self,
@@ -98,24 +99,31 @@ class AIEnhancementService: ObservableObject {
     /// buys nothing and costs the caller the whole retry ladder. Once a model
     /// reports an exhausted quota it is skipped until the cooldown expires; each
     /// consecutive refusal doubles the wait, and one success clears it.
+    ///
+    /// Persisted, because the common case is a DAILY cap: an in-memory map forgets
+    /// every exhausted model on relaunch, and the next dictation then pays the
+    /// refusal all over again for a quota that has hours left to run.
     private var quotaCooldownUntil: [String: Date] = [:]
     private var quotaCooldownDuration: [String: TimeInterval] = [:]
     private let minimumQuotaCooldown: TimeInterval = 60
-    private let maximumQuotaCooldown: TimeInterval = 3600
+    /// Four hours, not one: these are daily caps, and the ceiling only governs how
+    /// often a still-exhausted model is re-probed. Each probe costs one refusal.
+    private let maximumQuotaCooldown: TimeInterval = 14400
+    private let quotaCooldownDefaultsKey = "EnhancementQuotaCooldowns"
 
     private func quotaKey(for configuration: EnhancementRuntimeConfiguration) -> String? {
         guard let provider = configuration.provider else { return nil }
         return "\(provider.rawValue)/\(configuration.modelName ?? provider.defaultModel)"
     }
 
-    /// True while the configured model is known to be out of quota. Callers skip
-    /// enhancement entirely rather than paying a round trip to be refused.
+    /// True while the configured model is known to be out of quota.
     func isQuotaCooldownActive(for configuration: EnhancementRuntimeConfiguration) -> Bool {
         guard let key = quotaKey(for: configuration), let until = quotaCooldownUntil[key] else {
             return false
         }
         guard until > Date() else {
             quotaCooldownUntil[key] = nil
+            persistQuotaCooldowns()
             return false
         }
         return true
@@ -136,15 +144,44 @@ class AIEnhancementService: ObservableObject {
 
         quotaCooldownDuration[key] = duration
         quotaCooldownUntil[key] = Date().addingTimeInterval(duration)
+        persistQuotaCooldowns()
         logger.warning(
-            "Quota exhausted for \(key, privacy: .public) — skipping enhancement for \(Int(duration), privacy: .public)s"
+            "Quota exhausted for \(key, privacy: .public) — skipping it for \(Int(duration), privacy: .public)s"
         )
     }
 
     private func clearQuotaCooldown(for configuration: EnhancementRuntimeConfiguration) {
         guard let key = quotaKey(for: configuration) else { return }
+        guard quotaCooldownUntil[key] != nil || quotaCooldownDuration[key] != nil else { return }
         quotaCooldownUntil[key] = nil
         quotaCooldownDuration[key] = nil
+        persistQuotaCooldowns()
+    }
+
+    private func persistQuotaCooldowns() {
+        let stored = quotaCooldownUntil.reduce(into: [String: [String: TimeInterval]]()) { result, entry in
+            result[entry.key] = [
+                "until": entry.value.timeIntervalSince1970,
+                "duration": quotaCooldownDuration[entry.key] ?? minimumQuotaCooldown,
+            ]
+        }
+        UserDefaults.standard.set(stored, forKey: quotaCooldownDefaultsKey)
+    }
+
+    private func restoreQuotaCooldowns() {
+        guard
+            let stored = UserDefaults.standard.dictionary(forKey: quotaCooldownDefaultsKey)
+                as? [String: [String: TimeInterval]]
+        else { return }
+
+        let now = Date()
+        for (key, entry) in stored {
+            guard let untilInterval = entry["until"] else { continue }
+            let until = Date(timeIntervalSince1970: untilInterval)
+            guard until > now else { continue }
+            quotaCooldownUntil[key] = until
+            quotaCooldownDuration[key] = entry["duration"] ?? minimumQuotaCooldown
+        }
     }
 
     // MARK: - Fallback ladder
@@ -223,6 +260,67 @@ class AIEnhancementService: ObservableObject {
                 for: configuration.replacingModel(provider: rung.provider, modelName: rung.modelName)
             )
         }
+    }
+
+    /// LLMkit's OpenAI-compatible client sends no completion-token cap and never
+    /// reads `finish_reason`, so a long rewrite comes back cut mid-sentence and is
+    /// indistinguishable from a complete one — measured at exactly 2,048 tokens on
+    /// a real 11,415-character transcript. Pasting a silent truncation is the one
+    /// failure a fallback must never introduce, so keep long transcripts off those
+    /// rungs and let the ladder carry them somewhere that reports completion.
+    private let openAICompatibleFallbackCharacterLimit = 6000
+
+    private func usesOpenAICompatibleClient(_ provider: AIProvider) -> Bool {
+        switch provider {
+        case .gemini, .anthropic, .ollama, .localCLI:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func rungIsSafe(_ rung: EnhancementFallback, forTextOfLength length: Int) -> Bool {
+        length <= openAICompatibleFallbackCharacterLimit || !usesOpenAICompatibleClient(rung.provider)
+    }
+
+    /// The configuration enhancement would actually use right now: the mode's own
+    /// model when it is healthy, otherwise the first ladder rung that is. Nil means
+    /// every rung is cooling and the caller should deliver the raw transcript.
+    ///
+    /// This exists because a pre-flight that merely SKIPS when the configured model
+    /// is cooling makes the ladder reachable exactly once — on the dictation that
+    /// trips the refusal — and then withholds enhancement for the rest of the
+    /// cooldown even though a healthy rung was just proven to exist.
+    func usableConfiguration(
+        for configuration: EnhancementRuntimeConfiguration,
+        textLength: Int
+    ) -> EnhancementRuntimeConfiguration? {
+        guard isQuotaCooldownActive(for: configuration) else {
+            noteActiveSubstitution(nil)
+            return configuration
+        }
+        guard
+            let rung = fallbackLadder(after: configuration)
+                .first(where: { rungIsSafe($0, forTextOfLength: textLength) })
+        else { return nil }
+
+        let substitute = configuration.replacingModel(provider: rung.provider, modelName: rung.modelName)
+        noteActiveSubstitution(substitute)
+        return substitute
+    }
+
+    private var announcedSubstitutionKey: String?
+
+    /// Name the stand-in once per substitution, not once per dictation. Under a
+    /// daily cap this path is the normal state for hours, not an incident.
+    private func noteActiveSubstitution(_ configuration: EnhancementRuntimeConfiguration?) {
+        guard let configuration, let key = quotaKey(for: configuration) else {
+            announcedSubstitutionKey = nil
+            return
+        }
+        guard announcedSubstitutionKey != key else { return }
+        announcedSubstitutionKey = key
+        announceFallback(to: configuration)
     }
 
     private func announceFallback(to configuration: EnhancementRuntimeConfiguration) {
@@ -602,6 +700,7 @@ class AIEnhancementService: ObservableObject {
 
         var attempt = configuration
         var remainingRungs = fallbackLadder(after: configuration)
+            .filter { rungIsSafe($0, forTextOfLength: text.count) }
         var isFallback = false
         var lastError: EnhancementError?
 
@@ -616,7 +715,7 @@ class AIEnhancementService: ObservableObject {
                 clearQuotaCooldown(for: attempt)
                 lastUsedModelName = attempt.modelName ?? attempt.provider?.defaultModel
                 if isFallback {
-                    announceFallback(to: attempt)
+                    noteActiveSubstitution(attempt)
                     logger.notice("Enhanced via fallback model \(self.lastUsedModelName ?? "?", privacy: .public)")
                 }
                 return (result, Date().timeIntervalSince(startTime), promptName)

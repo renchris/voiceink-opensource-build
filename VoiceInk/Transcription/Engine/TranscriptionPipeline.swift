@@ -169,27 +169,30 @@ class TranscriptionPipeline {
                     !shouldRespondInRecorder && isSkipShortEnhancementEnabled
                     && WordCounter.count(in: text) <= shortEnhancementWordThreshold
 
-                // A model that is out of quota refuses every request until the
-                // quota resets, so dictation after dictation would pay the retry
-                // ladder to be told the same thing. Deliver the raw transcript
-                // immediately instead. Assistant modes are exempt: there the
-                // model's answer IS the output, so silence would be worse than
-                // the wait.
-                let isEnhancementQuotaExhausted =
-                    !shouldRespondInRecorder
-                    && resolvedEnhancementConfiguration.flatMap { configuration in
-                        enhancementService?.isQuotaCooldownActive(for: configuration)
-                    } == true
-                if isEnhancementQuotaExhausted {
-                    logger.warning("Skipping enhancement — configured model is out of quota")
+                // When the configured model is out of quota, RESOLVE past it rather
+                // than skipping: the ladder usually has a healthy rung, and skipping
+                // here is what made the ladder reachable only on the one dictation
+                // that tripped the refusal. Nil means every rung is cooling, and
+                // then the raw transcript really is the best available answer.
+                // Assistant modes are exempt: there the model's answer IS the
+                // output, so silence would be worse than the wait.
+                let effectiveEnhancementConfiguration = resolvedEnhancementConfiguration.flatMap {
+                    configuration -> EnhancementRuntimeConfiguration? in
+                    guard !shouldRespondInRecorder else { return configuration }
+                    return enhancementService?.usableConfiguration(
+                        for: configuration,
+                        textLength: text.count
+                    )
+                }
+                if resolvedEnhancementConfiguration != nil, effectiveEnhancementConfiguration == nil {
+                    logger.warning("Skipping enhancement — every model on the ladder is out of quota")
                 }
 
                 if let enhancementService,
-                    let resolvedEnhancementConfiguration,
+                    let resolvedEnhancementConfiguration = effectiveEnhancementConfiguration,
                     resolvedEnhancementConfiguration.isEnabled,
                     enhancementService.isConfigured(for: resolvedEnhancementConfiguration),
-                    !shouldSkipEnhancement,
-                    !isEnhancementQuotaExhausted
+                    !shouldSkipEnhancement
                 {
                     if shouldCancel() {
                         await finishCanceledTranscription()
