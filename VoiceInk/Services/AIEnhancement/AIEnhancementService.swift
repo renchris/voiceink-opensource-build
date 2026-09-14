@@ -204,10 +204,12 @@ class AIEnhancementService: ObservableObject {
     /// several recordings instead of making one of them wait for all of it.
     private let maximumFallbackAttempts = 2
 
-    /// Local models on this hardware have measured far slower than the cloud, so
-    /// a local rung gets a tighter budget than the user's enhancement timeout. It
-    /// is a fallback; it may not become the new stall.
-    private let localFallbackTimeout: TimeInterval = 8
+    /// A local rung gets a tighter budget than the user's enhancement timeout: it
+    /// is a fallback and may not become the new stall. 12s, not 8s — the measured
+    /// warm p90 for the best local model is 5.67s but its max over 132 calls on
+    /// real transcripts is 8.94s, so an 8s budget fails exactly the longest
+    /// dictations, which are the ones most expensive to redo.
+    private let localFallbackTimeout: TimeInterval = 12
 
     /// Off by default: a local rung that times out reintroduces exactly the delay
     /// this ladder exists to remove. Arm it once a local model is fast enough.
@@ -702,6 +704,7 @@ class AIEnhancementService: ObservableObject {
         var remainingRungs = fallbackLadder(after: configuration)
             .filter { rungIsSafe($0, forTextOfLength: text.count) }
         var isFallback = false
+        var hasDescendedOnTransientError = false
         var lastError: EnhancementError?
 
         for _ in 0...maximumFallbackAttempts {
@@ -722,12 +725,23 @@ class AIEnhancementService: ObservableObject {
             } catch let error as EnhancementError {
                 lastError = error
 
-                // Only a quota refusal moves down the ladder. Everything else —
-                // a bad key, a malformed request, a timeout — would fail the same
-                // way on every rung, so trying them all just spends the time this
-                // ladder exists to save.
-                guard case .rateLimitExceeded(_, let retryAfter) = error else { throw error }
-                openQuotaCooldown(for: attempt, retryAfter: retryAfter)
+                // A quota refusal descends the ladder and cools the model off. A
+                // timeout or a 5xx descends too — the provider is down or slow for
+                // this request, and a different one may answer — but it takes no
+                // cooldown (the model is not out of quota) and only ONE extra
+                // attempt, because unlike a 429, which is refused in 0.25s, each
+                // timeout costs the full budget before it fails.
+                switch error {
+                case .rateLimitExceeded(_, let retryAfter):
+                    openQuotaCooldown(for: attempt, retryAfter: retryAfter)
+                case .timeout, .serverError, .networkError:
+                    guard !hasDescendedOnTransientError else { throw error }
+                    hasDescendedOnTransientError = true
+                default:
+                    // A bad key or a malformed request fails identically on every
+                    // rung, so trying them all only spends the time this saves.
+                    throw error
+                }
 
                 guard !remainingRungs.isEmpty else { break }
                 let next = remainingRungs.removeFirst()
