@@ -79,13 +79,18 @@ class AIEnhancementService: ObservableObject {
     func isConfigured(for configuration: EnhancementRuntimeConfiguration) -> Bool {
         guard configuration.prompt != nil else { return false }
         guard let provider = configuration.provider else { return false }
+        return hasCredentials(provider: provider, modelName: configuration.modelName)
+    }
 
+    /// The provider half of `isConfigured`, for rungs: a ladder is built before
+    /// there is a prompt to check, and for the assistant path there never is one.
+    private func hasCredentials(provider: AIProvider, modelName: String?) -> Bool {
         if provider == .localCLI || provider == .ollama {
             return true
         }
 
         if provider == .custom {
-            guard let modelName = configuration.modelName else { return false }
+            guard let modelName else { return false }
             return CustomAIProviderManager.shared.requestConfiguration(forModel: modelName) != nil
         }
 
@@ -112,13 +117,21 @@ class AIEnhancementService: ObservableObject {
     private let quotaCooldownDefaultsKey = "EnhancementQuotaCooldowns"
 
     private func quotaKey(for configuration: EnhancementRuntimeConfiguration) -> String? {
-        guard let provider = configuration.provider else { return nil }
-        return "\(provider.rawValue)/\(configuration.modelName ?? provider.defaultModel)"
+        configuration.modelRef.map(quotaKey(for:))
+    }
+
+    private func quotaKey(for model: EnhancementModelRef) -> String {
+        "\(model.provider.rawValue)/\(model.modelName)"
     }
 
     /// True while the configured model is known to be out of quota.
     func isQuotaCooldownActive(for configuration: EnhancementRuntimeConfiguration) -> Bool {
-        guard let key = quotaKey(for: configuration), let until = quotaCooldownUntil[key] else {
+        guard let key = quotaKey(for: configuration) else { return false }
+        return isQuotaCooldownActive(key: key)
+    }
+
+    private func isQuotaCooldownActive(key: String) -> Bool {
+        guard let until = quotaCooldownUntil[key] else {
             return false
         }
         guard until > Date() else {
@@ -186,129 +199,69 @@ class AIEnhancementService: ObservableObject {
 
     // MARK: - Fallback ladder
 
-    /// Where enhancement goes when the configured model is out of quota, in order:
-    ///   1. models of the SAME provider the user already chose in another mode
-    ///   2. that provider's remaining published models
-    ///   3. other enhancement providers they have connected, at their selected model
-    ///   4. a local provider, last and only when armed (see isLocalFallbackEnabled)
-    /// Rungs already in cooldown are dropped, so a ladder walked once is not
-    /// re-walked on the next dictation. Running off the end is not a failure: the
-    /// caller delivers the raw transcript, which beats a stall.
-    struct EnhancementFallback {
-        let provider: AIProvider
-        let modelName: String
-    }
-
-    /// Bounds the worst case for a single dictation. Cooldowns persist between
-    /// dictations, so a longer ladder is still walked in full — just across
-    /// several recordings instead of making one of them wait for all of it.
-    private let maximumFallbackAttempts = 2
-
-    /// A local rung gets a tighter budget than the user's enhancement timeout: it
-    /// is a fallback and may not become the new stall. 12s, not 8s — the measured
-    /// warm p90 for the best local model is 5.67s but its max over 132 calls on
-    /// real transcripts is 8.94s, so an 8s budget fails exactly the longest
-    /// dictations, which are the ones most expensive to redo.
-    private let localFallbackTimeout: TimeInterval = 12
-
     /// Off by default: a local rung that times out reintroduces exactly the delay
     /// this ladder exists to remove. Arm it once a local model is fast enough.
     private var isLocalFallbackEnabled: Bool {
         UserDefaults.standard.bool(forKey: "EnhancementFallbackToLocal")
     }
 
-    private func isLocalProvider(_ provider: AIProvider?) -> Bool {
-        provider == .ollama || provider == .localCLI
-    }
+    /// The ladder for `anchor`'s mode (order: `EnhancementLadderPolicy.ladder`).
+    /// Rungs that are cooling or have no credentials are dropped: the first so a
+    /// ladder walked once is not re-walked on the next dictation, the second
+    /// because a rung that cannot even be asked must not cost a descent. Running
+    /// off the end is not a failure: the caller delivers the raw transcript,
+    /// which beats a stall.
+    private func fallbackLadder(
+        anchoredOn anchor: EnhancementRuntimeConfiguration,
+        excluding excluded: [EnhancementModelRef] = []
+    ) -> [EnhancementModelRef] {
+        guard let anchorRef = anchor.modelRef else { return [] }
 
-    private func fallbackLadder(after configuration: EnhancementRuntimeConfiguration) -> [EnhancementFallback] {
-        guard let provider = configuration.provider else { return [] }
-
-        var seen: Set<String> = ["\(provider.rawValue)/\(configuration.modelName ?? provider.defaultModel)"]
-        var ladder: [EnhancementFallback] = []
-
-        func append(_ candidateProvider: AIProvider, _ modelName: String) {
-            guard !modelName.isEmpty else { return }
-            let key = "\(candidateProvider.rawValue)/\(modelName)"
-            guard !seen.contains(key) else { return }
-            seen.insert(key)
-            ladder.append(EnhancementFallback(provider: candidateProvider, modelName: modelName))
+        let modeSelections = ModeManager.shared.configurations
+            .filter { $0.selectedAIProvider == anchorRef.provider.rawValue }
+            .compactMap { $0.selectedAIModel }
+        let otherProviders = aiService.connectedProviders.map {
+            EnhancementModelRef(provider: $0, modelName: aiService.selectedModel(for: $0))
         }
 
-        // 1. Their own choices elsewhere come before our list order.
-        for mode in ModeManager.shared.configurations
-        where mode.selectedAIProvider == provider.rawValue {
-            if let modelName = mode.selectedAIModel { append(provider, modelName) }
-        }
-
-        // 2. The rest of this provider's models.
-        for modelName in aiService.availableModels(for: provider) { append(provider, modelName) }
-
-        // 3. Other providers they have actually connected.
-        let connected = aiService.connectedProviders
-        for candidate in connected where candidate != provider && !isLocalProvider(candidate) {
-            append(candidate, aiService.selectedModel(for: candidate))
-        }
-
-        // 4. Local, last, and only when armed.
-        if isLocalFallbackEnabled {
-            for candidate in connected where isLocalProvider(candidate) {
-                append(candidate, aiService.selectedModel(for: candidate))
-            }
-        }
-
-        return ladder.filter { rung in
-            !isQuotaCooldownActive(
-                for: configuration.replacingModel(provider: rung.provider, modelName: rung.modelName)
-            )
+        return EnhancementLadderPolicy.ladder(
+            anchor: anchorRef,
+            modeSelections: modeSelections,
+            providerOrder: aiService.availableModels(for: anchorRef.provider),
+            otherProviders: otherProviders,
+            includeLocal: isLocalFallbackEnabled,
+            excluding: excluded
+        ).filter { rung in
+            hasCredentials(provider: rung.provider, modelName: rung.modelName)
+                && !isQuotaCooldownActive(key: quotaKey(for: rung))
         }
     }
 
-    /// LLMkit's OpenAI-compatible client sends no completion-token cap and never
-    /// reads `finish_reason`, so a long rewrite comes back cut mid-sentence and is
-    /// indistinguishable from a complete one — measured at exactly 2,048 tokens on
-    /// a real 11,415-character transcript. Pasting a silent truncation is the one
-    /// failure a fallback must never introduce, so keep long transcripts off those
-    /// rungs and let the ladder carry them somewhere that reports completion.
-    private let openAICompatibleFallbackCharacterLimit = 6000
-
-    private func usesOpenAICompatibleClient(_ provider: AIProvider) -> Bool {
-        switch provider {
-        case .gemini, .anthropic, .ollama, .localCLI:
-            return false
-        default:
-            return true
-        }
-    }
-
-    private func rungIsSafe(_ rung: EnhancementFallback, forTextOfLength length: Int) -> Bool {
-        length <= openAICompatibleFallbackCharacterLimit || !usesOpenAICompatibleClient(rung.provider)
-    }
-
-    /// The configuration enhancement would actually use right now: the mode's own
-    /// model when it is healthy, otherwise the first ladder rung that is. Nil means
-    /// every rung is cooling and the caller should deliver the raw transcript.
+    /// The configuration enhancement would actually use right now: the given one
+    /// when it is healthy, otherwise the first safe rung of its ANCHOR's ladder
+    /// that is. Nil means every rung is cooling and the caller should deliver the
+    /// raw transcript.
     ///
     /// This exists because a pre-flight that merely SKIPS when the configured model
     /// is cooling makes the ladder reachable exactly once — on the dictation that
     /// trips the refusal — and then withholds enhancement for the rest of the
     /// cooldown even though a healthy rung was just proven to exist.
+    ///
+    /// Pure of side effects: it may run for a mode whose enhancement is off, so
+    /// it announces nothing. Only a substitute that actually answered is named.
     func usableConfiguration(
         for configuration: EnhancementRuntimeConfiguration,
         textLength: Int
     ) -> EnhancementRuntimeConfiguration? {
-        guard isQuotaCooldownActive(for: configuration) else {
-            noteActiveSubstitution(nil)
-            return configuration
-        }
+        guard isQuotaCooldownActive(for: configuration) else { return configuration }
         guard
-            let rung = fallbackLadder(after: configuration)
-                .first(where: { rungIsSafe($0, forTextOfLength: textLength) })
+            let rung = fallbackLadder(
+                anchoredOn: configuration.anchor,
+                excluding: configuration.modelRef.map { [$0] } ?? []
+            ).first(where: { EnhancementLadderPolicy.rungIsSafe($0, textLength: textLength) })
         else { return nil }
 
-        let substitute = configuration.replacingModel(provider: rung.provider, modelName: rung.modelName)
-        noteActiveSubstitution(substitute)
-        return substitute
+        return configuration.replacingModel(provider: rung.provider, modelName: rung.modelName)
     }
 
     private var announcedSubstitutionKey: String?
@@ -420,12 +373,20 @@ class AIEnhancementService: ObservableObject {
             .joined(separator: "\n\n")
     }
 
+    /// One answer together with the exact payload that produced it, so the
+    /// outcome never has to read the payload back out of the shared slots.
+    private struct EnhancementResponse {
+        let text: String
+        let systemMessage: String?
+        let userMessage: String?
+    }
+
     private func makeRequest(
         text: String,
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot?,
         timeoutOverride: TimeInterval? = nil
-    ) async throws -> String {
+    ) async throws -> EnhancementResponse {
         let requestTimeout = timeoutOverride ?? baseTimeout
         guard isConfigured(for: configuration) else {
             throw EnhancementError.notConfigured
@@ -441,7 +402,7 @@ class AIEnhancementService: ObservableObject {
         let modelName = configuration.modelName ?? provider.defaultModel
 
         guard !text.isEmpty else {
-            return ""
+            return EnhancementResponse(text: "", systemMessage: nil, userMessage: nil)
         }
 
         let formattedText = "\n<TRANSCRIPT>\n\(text)\n</TRANSCRIPT>"
@@ -456,6 +417,10 @@ class AIEnhancementService: ObservableObject {
             self.lastUserMessageSent = formattedText
         }
 
+        func response(_ result: String) -> EnhancementResponse {
+            EnhancementResponse(text: result, systemMessage: systemMessage, userMessage: formattedText)
+        }
+
         if provider == .ollama {
             do {
                 let result = try await aiService.enhanceWithOllama(
@@ -464,19 +429,21 @@ class AIEnhancementService: ObservableObject {
                     model: modelName,
                     timeout: requestTimeout
                 )
-                return AIEnhancementOutputFilter.filter(result)
-            } catch {
-                if let localError = error as? LocalAIError {
-                    switch localError {
-                    case .timeout:
-                        throw EnhancementError.timeout
-                    default:
-                        throw EnhancementError.customError(
-                            localError.errorDescription ?? "An unknown Ollama error occurred.")
-                    }
-                } else {
-                    throw EnhancementError.customError(error.localizedDescription)
+                return response(AIEnhancementOutputFilter.filter(result))
+            } catch let localError as LocalAIError {
+                switch localError {
+                case .timeout:
+                    throw EnhancementError.timeout
+                case .serviceUnavailable:
+                    // LLMkit's network error, renamed by OllamaService: Ollama is
+                    // not running, which no other Ollama model will fix either.
+                    throw EnhancementError.networkError
+                default:
+                    throw EnhancementError.customError(
+                        localError.errorDescription ?? "An unknown Ollama error occurred.")
                 }
+            } catch {
+                throw EnhancementLadderPolicy.mapUntypedError(error)
             }
         }
 
@@ -484,9 +451,11 @@ class AIEnhancementService: ObservableObject {
             do {
                 let result = try await aiService.enhanceWithLocalCLI(
                     systemPrompt: systemMessage, userPrompt: formattedText)
-                return AIEnhancementOutputFilter.filter(result)
+                return response(AIEnhancementOutputFilter.filter(result))
             } catch {
-                if let localError = error as? LocalCLIError {
+                if EnhancementLadderPolicy.isCancellation(error) {
+                    throw CancellationError()
+                } else if let localError = error as? LocalCLIError {
                     throw EnhancementError.customError(
                         localError.errorDescription ?? "An unknown Local CLI error occurred.")
                 } else {
@@ -560,13 +529,14 @@ class AIEnhancementService: ObservableObject {
                     timeout: requestTimeout
                 )
             }
-            return AIEnhancementOutputFilter.filter(result.trimmingCharacters(in: .whitespacesAndNewlines))
+            return response(
+                AIEnhancementOutputFilter.filter(result.trimmingCharacters(in: .whitespacesAndNewlines)))
         } catch let error as LLMKitError {
             throw mapLLMKitError(error)
         } catch let error as EnhancementError {
             throw error
         } catch {
-            throw EnhancementError.customError(error.localizedDescription)
+            throw EnhancementLadderPolicy.mapUntypedError(error)
         }
     }
 
@@ -611,18 +581,21 @@ class AIEnhancementService: ObservableObject {
         UserDefaults.standard.bool(forKey: "EnhancementRetryOnTimeout")
     }
 
+    /// Only a timeout is retried here, and only on the configured model. A 429,
+    /// a 5xx and a network error are not: LLMkit's `performRequest` already made
+    /// three attempts of each with backoff, so a retry at this layer squares its
+    /// count — up to nine full-payload requests before one descent — and spends
+    /// more of a quota that is exhausted for the day.
     private func makeRequestWithRetry(
         text: String,
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot?,
         timeoutOverride: TimeInterval? = nil,
-        maxRetries: Int = 3,
-        initialDelay: TimeInterval = 1.0
-    ) async throws -> String {
-        var retries = 0
-        var currentDelay = initialDelay
-
-        while retries < maxRetries {
+        retriesTimeout: Bool,
+        maxAttempts: Int = 3
+    ) async throws -> EnhancementResponse {
+        var attempt = 1
+        while true {
             do {
                 return try await makeRequest(
                     text: text,
@@ -630,65 +603,14 @@ class AIEnhancementService: ObservableObject {
                     contextSnapshot: contextSnapshot,
                     timeoutOverride: timeoutOverride
                 )
-            } catch let error as EnhancementError {
-                switch error {
-                // 429 is NOT retried here: LLMkit's performRequest already made three
-                // attempts with backoff, and a quota that is exhausted for the day only
-                // gets worse if we spend more of it.
-                case .networkError, .serverError:
-                    retries += 1
-                    if retries < maxRetries {
-                        logger.warning(
-                            "Request failed, retrying in \(currentDelay, privacy: .public)s... (Attempt \(retries, privacy: .public)/\(maxRetries, privacy: .public))"
-                        )
-                        try await Task.sleep(nanoseconds: UInt64(currentDelay * 1_000_000_000))
-                        currentDelay *= 2
-                    } else {
-                        logger.error("Request failed after \(maxRetries, privacy: .public) retries.")
-                        throw error
-                    }
-                case .timeout:
-                    if retryOnTimeout {
-                        retries += 1
-                        if retries < maxRetries {
-                            logger.warning(
-                                "Request timed out, retrying immediately... (Attempt \(retries, privacy: .public)/\(maxRetries, privacy: .public))"
-                            )
-                        } else {
-                            logger.error("Request timed out after \(maxRetries, privacy: .public) retries.")
-                            throw error
-                        }
-                    } else {
-                        logger.error("Request timed out, failing immediately (retry disabled).")
-                        throw error
-                    }
-                default:
-                    throw error
-                }
-            } catch {
-                let nsError = error as NSError
-                if nsError.domain == NSURLErrorDomain
-                    && [NSURLErrorNotConnectedToInternet, NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost].contains(
-                        nsError.code)
-                {
-                    retries += 1
-                    if retries < maxRetries {
-                        logger.warning(
-                            "Request failed with network error, retrying in \(currentDelay, privacy: .public)s... (Attempt \(retries, privacy: .public)/\(maxRetries, privacy: .public))"
-                        )
-                        try await Task.sleep(nanoseconds: UInt64(currentDelay * 1_000_000_000))
-                        currentDelay *= 2
-                    } else {
-                        logger.error("Request failed after \(maxRetries, privacy: .public) retries with network error.")
-                        throw EnhancementError.networkError
-                    }
-                } else {
-                    throw error
-                }
+            } catch EnhancementError.timeout where retriesTimeout && attempt < maxAttempts {
+                try Task.checkCancellation()
+                logger.warning(
+                    "Request timed out, retrying immediately... (Attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public))"
+                )
+                attempt += 1
             }
         }
-
-        throw EnhancementError.enhancementFailed
     }
 
     func enhance(
@@ -696,61 +618,12 @@ class AIEnhancementService: ObservableObject {
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot? = nil
     ) async throws -> (String, TimeInterval, String?) {
-        let startTime = Date()
-        let promptName = configuration.prompt?.title
-        lastUsedModelName = nil
-
-        var attempt = configuration
-        var remainingRungs = fallbackLadder(after: configuration)
-            .filter { rungIsSafe($0, forTextOfLength: text.count) }
-        var isFallback = false
-        var hasDescendedOnTransientError = false
-        var lastError: EnhancementError?
-
-        for _ in 0...maximumFallbackAttempts {
-            do {
-                let result = try await makeRequestWithRetry(
-                    text: text,
-                    configuration: attempt,
-                    contextSnapshot: contextSnapshot,
-                    timeoutOverride: isFallback && isLocalProvider(attempt.provider) ? localFallbackTimeout : nil
-                )
-                clearQuotaCooldown(for: attempt)
-                lastUsedModelName = attempt.modelName ?? attempt.provider?.defaultModel
-                if isFallback {
-                    noteActiveSubstitution(attempt)
-                    logger.notice("Enhanced via fallback model \(self.lastUsedModelName ?? "?", privacy: .public)")
-                }
-                return (result, Date().timeIntervalSince(startTime), promptName)
-            } catch let error as EnhancementError {
-                lastError = error
-
-                // A quota refusal descends the ladder and cools the model off. A
-                // timeout or a 5xx descends too — the provider is down or slow for
-                // this request, and a different one may answer — but it takes no
-                // cooldown (the model is not out of quota) and only ONE extra
-                // attempt, because unlike a 429, which is refused in 0.25s, each
-                // timeout costs the full budget before it fails.
-                switch error {
-                case .rateLimitExceeded(_, let retryAfter):
-                    openQuotaCooldown(for: attempt, retryAfter: retryAfter)
-                case .timeout, .serverError, .networkError:
-                    guard !hasDescendedOnTransientError else { throw error }
-                    hasDescendedOnTransientError = true
-                default:
-                    // A bad key or a malformed request fails identically on every
-                    // rung, so trying them all only spends the time this saves.
-                    throw error
-                }
-
-                guard !remainingRungs.isEmpty else { break }
-                let next = remainingRungs.removeFirst()
-                attempt = configuration.replacingModel(provider: next.provider, modelName: next.modelName)
-                isFallback = true
-            }
-        }
-
-        throw lastError ?? EnhancementError.enhancementFailed
+        let outcome = try await enhanceDetailed(
+            text,
+            configuration: configuration,
+            contextSnapshot: contextSnapshot
+        )
+        return (outcome.text, outcome.duration, outcome.promptName)
     }
 
     // MARK: - Caller contract
@@ -775,19 +648,95 @@ class AIEnhancementService: ObservableObject {
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot? = nil
     ) async throws -> EnhancementOutcome {
-        let (result, duration, promptName) = try await enhance(
-            text,
-            configuration: configuration,
-            contextSnapshot: contextSnapshot
-        )
-        return EnhancementOutcome(
-            text: result,
-            duration: duration,
-            promptName: promptName,
-            modelName: lastUsedModelName ?? configuration.modelName ?? configuration.provider?.defaultModel,
-            systemMessage: lastSystemMessageSent,
-            userMessage: lastUserMessageSent
-        )
+        let startTime = Date()
+        let promptName = configuration.prompt?.title
+        lastUsedModelName = nil
+
+        // A missing prompt fails identically on every rung; walking them would
+        // only turn one clear error into six.
+        guard configuration.prompt != nil else { throw EnhancementError.notConfigured }
+
+        // Resolve attempt 1 exactly as a ladder rung is resolved. Asking a model
+        // already known to be out of quota costs LLMkit's three refusals, and each
+        // one would otherwise re-open its cooldown — for every caller, not only
+        // the ones that remembered to resolve first.
+        guard var attempt = usableConfiguration(for: configuration, textLength: text.count) else {
+            // Nothing new was learned about any model, so nothing is cooled.
+            throw EnhancementError.rateLimitExceeded(
+                detail: "every model on the fallback ladder is out of quota",
+                retryAfter: nil
+            )
+        }
+
+        var remainingRungs = fallbackLadder(
+            anchoredOn: configuration.anchor,
+            excluding: attempt.modelRef.map { [$0] } ?? []
+        ).filter { EnhancementLadderPolicy.rungIsSafe($0, textLength: text.count) }
+        let maximumDescents = EnhancementLadderPolicy.maximumDescents(ladderCount: remainingRungs.count)
+        var transientDescentUsed = false
+        var lastError: Error?
+
+        for _ in 0...maximumDescents {
+            try Task.checkCancellation()
+            do {
+                let response = try await makeRequestWithRetry(
+                    text: text,
+                    configuration: attempt,
+                    contextSnapshot: contextSnapshot,
+                    timeoutOverride: EnhancementLadderPolicy.timeoutOverride(
+                        provider: attempt.provider,
+                        isSubstitute: attempt.isSubstitute
+                    ),
+                    retriesTimeout: EnhancementLadderPolicy.retriesTimeout(
+                        isSubstitute: attempt.isSubstitute,
+                        retryOnTimeoutEnabled: retryOnTimeout
+                    )
+                )
+                clearQuotaCooldown(for: attempt)
+                let modelName = attempt.modelName ?? attempt.provider?.defaultModel
+                lastUsedModelName = modelName
+                noteActiveSubstitution(attempt.isSubstitute ? attempt : nil)
+                if attempt.isSubstitute {
+                    logger.notice("Enhanced via fallback model \(modelName ?? "?", privacy: .public)")
+                }
+                return EnhancementOutcome(
+                    text: response.text,
+                    duration: Date().timeIntervalSince(startTime),
+                    promptName: promptName,
+                    modelName: modelName,
+                    systemMessage: response.systemMessage,
+                    userMessage: response.userMessage
+                )
+            } catch {
+                let kind = EnhancementLadderPolicy.failureKind(of: error)
+                // A cancelled recording must not fire the next rung.
+                if kind == .cancelled { throw CancellationError() }
+                lastError = error
+
+                if case .rateLimitExceeded(_, let retryAfter)? = error as? EnhancementError {
+                    openQuotaCooldown(for: attempt, retryAfter: retryAfter)
+                }
+
+                guard
+                    let failed = attempt.modelRef,
+                    let descent = EnhancementLadderPolicy.descend(
+                        from: failed,
+                        kind: kind,
+                        remaining: remainingRungs,
+                        transientDescentUsed: transientDescentUsed
+                    )
+                else { throw error }
+
+                if kind == .transient { transientDescentUsed = true }
+                remainingRungs = descent.remaining
+                attempt = configuration.replacingModel(
+                    provider: descent.next.provider,
+                    modelName: descent.next.modelName
+                )
+            }
+        }
+
+        throw lastError ?? EnhancementError.enhancementFailed
     }
 
     /// For requests that bypass `enhance()` — the assistant's follow-up turns. The

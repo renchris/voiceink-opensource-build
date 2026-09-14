@@ -26,6 +26,13 @@ struct TranscriptionFormattingConfiguration {
     let isTextFormattingEnabled: Bool
 }
 
+/// One model of one provider — a rung of the enhancement fallback ladder, and
+/// the anchor a substituted configuration remembers.
+struct EnhancementModelRef: Hashable {
+    let provider: AIProvider
+    let modelName: String
+}
+
 struct EnhancementRuntimeConfiguration {
     let mode: ModeConfig?
     let isEnabled: Bool
@@ -35,11 +42,41 @@ struct EnhancementRuntimeConfiguration {
     let useClipboardContext: Bool
     let useSelectedTextContext: Bool
     let useScreenCaptureContext: Bool
+    /// The model the mode asked for, when this configuration is a stand-in for
+    /// it. The ladder is always built from that anchor: re-deriving it from the
+    /// substitute would put the substitute's provider first and lose the order.
+    var substitutedFrom: EnhancementModelRef? = nil
 
-    /// Same request, aimed at a different model — the rung of the fallback ladder
-    /// taken when the configured model is out of quota.
+    var isSubstitute: Bool { substitutedFrom != nil }
+
+    /// The model this configuration names, with the provider's default standing
+    /// in for an unset name — the same identity the quota cooldowns key on.
+    var modelRef: EnhancementModelRef? {
+        guard let provider else { return nil }
+        return EnhancementModelRef(provider: provider, modelName: modelName ?? provider.defaultModel)
+    }
+
+    /// The configuration the mode asked for, before any substitution.
+    var anchor: EnhancementRuntimeConfiguration {
+        guard let substitutedFrom else { return self }
+        return EnhancementRuntimeConfiguration(
+            mode: mode,
+            isEnabled: isEnabled,
+            prompt: prompt,
+            provider: substitutedFrom.provider,
+            modelName: substitutedFrom.modelName,
+            useClipboardContext: useClipboardContext,
+            useSelectedTextContext: useSelectedTextContext,
+            useScreenCaptureContext: useScreenCaptureContext
+        )
+    }
+
+    /// Same request, aimed at a different model — a rung of the fallback ladder.
+    /// Remembers the original anchor however many rungs deep the walk goes, and
+    /// aiming back at the anchor itself yields the anchor, not a "substitute".
     func replacingModel(provider: AIProvider, modelName: String) -> EnhancementRuntimeConfiguration {
-        EnhancementRuntimeConfiguration(
+        let anchorRef = substitutedFrom ?? modelRef
+        return EnhancementRuntimeConfiguration(
             mode: mode,
             isEnabled: isEnabled,
             prompt: prompt,
@@ -47,7 +84,9 @@ struct EnhancementRuntimeConfiguration {
             modelName: modelName,
             useClipboardContext: useClipboardContext,
             useSelectedTextContext: useSelectedTextContext,
-            useScreenCaptureContext: useScreenCaptureContext
+            useScreenCaptureContext: useScreenCaptureContext,
+            substitutedFrom: anchorRef == EnhancementModelRef(provider: provider, modelName: modelName)
+                ? nil : anchorRef
         )
     }
 
@@ -60,7 +99,8 @@ struct EnhancementRuntimeConfiguration {
             modelName: modelName,
             useClipboardContext: useClipboardContext,
             useSelectedTextContext: useSelectedTextContext,
-            useScreenCaptureContext: useScreenCaptureContext
+            useScreenCaptureContext: useScreenCaptureContext,
+            substitutedFrom: substitutedFrom
         )
     }
 }
