@@ -7,6 +7,27 @@ import SwiftData
 import SwiftUI
 
 @main
+enum VoiceInkEntryPoint {
+    static func main() {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["XCTestConfigurationFilePath"] != nil || environment["XCTestBundlePath"] != nil {
+            UnitTestHostApp.main()
+        } else {
+            VoiceInkApp.main()
+        }
+    }
+}
+
+/// Hosts the unit-test bundle without booting the real app. The full app opens
+/// the user's persistent store (whose CloudKit setup traps in an unentitled test
+/// build), registers global hotkeys and shares this bundle id's defaults with the
+/// copy of VoiceInk the user is running — none of which a unit test may touch.
+private struct UnitTestHostApp: App {
+    var body: some Scene {
+        Settings { EmptyView() }
+    }
+}
+
 struct VoiceInkApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     let container: ModelContainer
