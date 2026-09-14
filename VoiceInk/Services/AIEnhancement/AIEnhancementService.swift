@@ -235,7 +235,7 @@ class AIEnhancementService: ObservableObject {
         return EnhancementLadderPolicy.ladder(
             anchor: anchorRef,
             modeSelections: modeSelections,
-            providerOrder: aiService.availableModels(for: anchorRef.provider),
+            providerOrder: aiService.fallbackOrder(for: anchorRef.provider),
             otherProviders: otherProviders,
             includeLocal: isLocalFallbackEnabled,
             excluding: excluded

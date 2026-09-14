@@ -153,6 +153,30 @@ enum AIProvider: String, CaseIterable {
         }
     }
 
+    /// The order the enhancement fallback ladder descends this provider's models
+    /// in — deliberately not the picker's order, so reordering or pruning the
+    /// ladder never reorders or prunes what the user can choose. Gemini's puts
+    /// flash before lite: capacity is plentiful and lite's rewrite quality has
+    /// never been scored, and once the primary walls, rung 2 serves the rest of
+    /// the day. It leaves out `gemini-3.1-pro-preview`, which has no free tier
+    /// and so is a dead rung on a free key; it stays selectable in the picker.
+    var fallbackOrder: [String] {
+        switch self {
+        case .gemini:
+            return [
+                "gemini-3.8-flash",
+                "gemini-3.7-flash",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash",
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-flash-lite",
+            ]
+        default:
+            return availableModels
+        }
+    }
+
     var requiresAPIKey: Bool {
         switch self {
         case .ollama, .localCLI:
@@ -284,6 +308,17 @@ class AIService: ObservableObject {
             return CustomAIProviderManager.shared.availableModelNames
         }
         return provider.availableModels
+    }
+
+    /// `AIProvider.fallbackOrder`, with the lists only known at runtime filled in
+    /// exactly as `availableModels(for:)` fills them.
+    func fallbackOrder(for provider: AIProvider) -> [String] {
+        switch provider {
+        case .ollama, .openRouter, .custom:
+            return availableModels(for: provider)
+        default:
+            return provider.fallbackOrder
+        }
     }
 
     init() {
